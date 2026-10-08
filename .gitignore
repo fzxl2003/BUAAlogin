@@ -1,0 +1,15 @@
+.vscode/
+
+*.pyc
+
+.idea
+.env
+.env.*
+__pycache__/
+*.log
+.venv*/
+build/
+dist/
+releases/
+*.spec
+.DS_Store
