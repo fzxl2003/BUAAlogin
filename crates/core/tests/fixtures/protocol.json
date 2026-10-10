@@ -1,0 +1,32 @@
+[
+  {
+    "username": "test",
+    "password": "a b'\"\\c",
+    "ip": "10.1.2.3",
+    "acid": "78",
+    "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "encrypted_password": "{MD5}6f16dc9477369b8aada603701f389832",
+    "info": "{SRBX1}QGZ64jYqskKV98WJ64XFK77y325RUaxsIOf6CWgSW6PA+tFuBvRDEwY4FdNVtOverWQvZ1PakLjJSO5fjNPqx1B1SyGclQHarPdSzY4Hm6bBlzZD8AfJs57Y5X4yyrkt",
+    "checksum": "1d1a43841775357b9f7df5c33a93e46e211beabe"
+  },
+  {
+    "username": "学生",
+    "password": "密碼 café",
+    "ip": "10.1.2.3",
+    "acid": "78",
+    "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "encrypted_password": "{MD5}40299019ad8c9ef134bb678bbb5361b6",
+    "info": "{SRBX1}0VMe3y7UPX45tvqYFVf2c7wsSdMvCDJKqEHxH2PeHmnafJZmHnTI/8skpU9nCoMmC3D/mlQsOGaHJY+XfSAX1jLeYquaKG7aA6hT7Bm15nJgHj+9GBmXwCGYLGb=",
+    "checksum": "1bd80127486c6f1eddd6e1f817283c31584a7023"
+  },
+  {
+    "username": "emoji",
+    "password": "🔑密码",
+    "ip": "10.1.2.3",
+    "acid": "78",
+    "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "encrypted_password": "{MD5}f0227c85427857cb8a32a025d9df0689",
+    "info": "{SRBX1}OkqdYbIlWHfyQvPGj9whhl0ecJpNVxqsOznMIDNxR3Hi6IFWWKRdHblsaO8NdJornH3Usrtnic5v4qlVuCuhvSClpdYuXI2VrAchbIUa9JOgOM5KxaND/qNN9UZ=",
+    "checksum": "e32e33ca9bf9ff808f71ef3d13e212b799777237"
+  }
+]

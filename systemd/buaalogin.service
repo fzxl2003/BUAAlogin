@@ -1,14 +1,17 @@
 [Unit]
-Description=BUAA Auto Login Service
+Description=BUAA Native Auto Login
 After=network.target
 
 [Service]
-Environment=PYTHONUNBUFFERED=1
-StandardOutput=append:/var/log/buaalogin.log
 Type=simple
+EnvironmentFile=/etc/buaalogin.env
+ExecStart=/usr/local/bin/buaalogin
+DynamicUser=yes
 Restart=on-failure
-RestartSec=5s
-ExecStart=/your/path/to/python /your/path/to/BUAALogin/always_online.py
+RestartSec=30s
+TimeoutStopSec=5s
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

@@ -1,1 +1,0 @@
-# Python standard library only. Install curl with your OS package manager.

@@ -1,0 +1,9 @@
+[package]
+name = "buaalogin-windows"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+buaa-core = { path = "../core" }
+serde_json.workspace = true
+windows-sys.workspace = true

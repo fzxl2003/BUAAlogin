@@ -1,0 +1,15 @@
+[package]
+name = "buaalogin"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+buaa-core = { path = "../core" }
+serde_json.workspace = true
+signal-hook = "0.3"
+
+[dev-dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

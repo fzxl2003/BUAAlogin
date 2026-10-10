@@ -1,10 +1,6 @@
-.git
-.venv*
-build
-dist
-releases
-tests
-*.log
-.env*
-__pycache__
-*.pyc
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/
+!crates/**

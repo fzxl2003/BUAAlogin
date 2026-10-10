@@ -1,9 +1,14 @@
-name: Build and release
+name: Native build and preview release
 
 on:
   push:
     branches: ['**']
   workflow_dispatch:
+    inputs:
+      promote_native:
+        description: 'After completing the documented real-device acceptance, publish native as latest'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -15,12 +20,14 @@ concurrency:
 jobs:
   windows:
     runs-on: windows-latest
+    env:
+      RUSTFLAGS: '-C target-feature=+crt-static'
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.14'
-      - run: python tools/build.py windows
+      - run: rustup toolchain install 1.90.0 --profile minimal --component rustfmt --component clippy
+      - run: cargo test --locked --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: ./tools/build-windows.ps1
       - uses: actions/upload-artifact@v4
         with:
           name: windows
@@ -29,14 +36,15 @@ jobs:
 
   macos:
     runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.14'
-          architecture: arm64
-      - run: python -m pip install -r requirements-build.txt
-      - run: python tools/build.py macos
+      - run: rustup toolchain install 1.90.0 --profile minimal --component rustfmt --component clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo test --locked --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: ./tools/build-macos.sh
       - uses: actions/upload-artifact@v4
         with:
           name: macos
@@ -52,6 +60,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
+      - name: Test both Linux architectures
+        run: |
+          docker buildx build --platform linux/amd64,linux/arm64 --target test --output type=cacheonly .
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -62,22 +73,36 @@ jobs:
         shell: bash
         env:
           REPOSITORY: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+          PROMOTE: ${{ inputs.promote_native }}
         run: |
           image="ghcr.io/${REPOSITORY,,}"
-          echo "name=$image" >> "$GITHUB_OUTPUT"
+          {
+            echo 'tags<<EOF'
+            echo "$image:native-preview"
+            echo "$image:sha-$COMMIT"
+            if [ "$PROMOTE" = true ]; then echo "$image:latest"; fi
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
+          target: runtime
           push: true
-          tags: |
-            ${{ steps.image.outputs.name }}:latest
-            ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
+          tags: ${{ steps.image.outputs.tags }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Runtime smoke test
+        run: |
+          docker build -t buaalogin:smoke .
+          docker run --rm buaalogin:smoke --help
+          code=0
+          docker run --rm buaalogin:smoke --status || code=$?
+          test "$code" -eq 1
 
   release:
     needs: [windows, macos, docker]
@@ -85,13 +110,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download Windows package
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: windows
           path: artifacts
-      - name: Download Mac ARM package
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: macos
           path: artifacts
@@ -99,7 +122,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: build-${{ github.run_number }}-${{ github.run_attempt }}
+          RELEASE_TAG: native-${{ github.run_number }}-${{ github.run_attempt }}
           COMMIT: ${{ github.sha }}
+          PROMOTE: ${{ inputs.promote_native }}
         run: |
-          gh release create "$RELEASE_TAG" artifacts/*.zip --target "$COMMIT" --title "BUAALogin $RELEASE_TAG" --notes "Windows x64 与 macOS ARM 桌面版；Docker 镜像见本仓库的 GHCR Packages。"
+          options=(--prerelease)
+          if [ "$PROMOTE" = true ]; then options=(--latest); fi
+          gh release create "$RELEASE_TAG" artifacts/*.zip --target "$COMMIT" \
+            --title "BUAALogin $RELEASE_TAG" "${options[@]}" \
+            --notes 'Rust 共享内核、原生桌面界面；首次使用须重新输入凭据。Docker 预览镜像标签 native-preview。正式替换前须完成仓库 docs/acceptance.md 的实机与能耗验收。'
