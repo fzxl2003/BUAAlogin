@@ -33,14 +33,11 @@ docker run -d --name buaalogin --restart unless-stopped --network host \
 
 保留命令行选项：`--status`、`--once`、`--interface`、`--gateway-ip`、`--interval`（10–86400 秒整数）、`--debug`、`--log-file`。`--debug` 输出脱敏状态事件，不输出原始请求、凭据或 token。容器默认以非 root 用户运行，日志文件需使用可写挂载路径。停止容器通过 SIGTERM 取消监控；可用 `docker logs -f buaalogin` 查看状态变化。
 
-## 编译与验证
+## 编译与发行
 
 Rust 工具链由 `rust-toolchain.toml` 固定，依赖由 `Cargo.lock` 固定。
 
 ```sh
-cargo test --locked --workspace
-cargo clippy --locked --workspace --all-targets -- -D warnings
-
 # 在 Apple Silicon Mac 上，需系统 Command Line Tools
 ./tools/build-macos.sh
 
@@ -50,14 +47,13 @@ powershell -NoProfile -File tools/build-windows.ps1
 # 在 Linux 上，需 libcurl 开发包与 pkg-config
 cargo build --locked --release -p buaalogin
 
-# 原生 Docker 镜像及 Linux 测试阶段
+# 原生 Docker 镜像
 docker build -t buaalogin:local .
-docker build --target test .
 ```
 
 桌面产物位于 `releases/`，macOS 解包构建目录为 `build/macos-native/BUAALogin.app`。Windows 静态链接 libcurl 与 CRT，使用 Schannel；macOS 链接系统 libcurl；Docker 链接发行版 libcurl/TLS 与 CA 证书。
 
-push 自动执行测试、构建两个桌面包和双架构镜像，发布 GitHub **预览 Release** 和 GHCR `native-preview`、`sha-<提交SHA>`，不自动覆盖已有 `latest`。完成 [实机与能耗验收](docs/acceptance.md) 后，可手动运行工作流并勾选 `promote_native`，发布正式 Release 和 `latest`。
+push 自动构建两个桌面包和双架构镜像，不执行测试、格式或 lint 门禁；构建成功后发布 GitHub **预览 Release** 和 GHCR `native-preview`、`sha-<提交SHA>`，不自动覆盖已有 `latest`。完成 [实机与能耗验收](docs/acceptance.md) 后，可手动运行工作流并勾选 `promote_native`，发布正式 Release 和 `latest`。
 
 [架构与 C ABI](docs/native-architecture.md) 说明内核接口、线程与资源生命周期。仓库仅保留原生实现；Python、PowerShell 桌面入口及旧打包产物已移除。
 

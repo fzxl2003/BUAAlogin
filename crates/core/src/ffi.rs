@@ -201,12 +201,17 @@ mod tests {
             let client = buaa_create(json.as_ptr(), Some(receive), context as _);
             assert!(!client.is_null());
             assert_eq!(buaa_start(client), 0);
-            assert_eq!(
-                rx.recv_timeout(std::time::Duration::from_secs(2))
-                    .unwrap()
-                    .state,
-                "waiting_network"
-            );
+            // UI snapshots may precede the lifecycle event. Keep the same bounded wait.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let first = loop {
+                let event = rx
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap();
+                if event.state != "dashboard" {
+                    break event;
+                }
+            };
+            assert_eq!(first.state, "waiting_network");
             assert_eq!(buaa_start(client), -2);
             buaa_stop(client);
             buaa_free(client);
