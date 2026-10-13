@@ -1,3 +1,4 @@
+use crate::appearance::{self, Palette};
 use buaa_core::{
     engine::{Handle, Mode},
     Config, DashboardSnapshot, Event,
@@ -14,12 +15,12 @@ use windows_sys::Win32::{
     Security::Cryptography::*,
     System::{
         LibraryLoader::*,
-        SystemServices::{SS_CENTERIMAGE, SS_ICON},
+        SystemServices::{SS_ENDELLIPSIS, SS_OWNERDRAW},
         Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
     },
     UI::{
         Controls::*,
-        Input::KeyboardAndMouse::{EnableWindow, SetFocus},
+        Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus},
         Shell::*,
         WindowsAndMessaging::*,
     },
@@ -44,6 +45,7 @@ const REMEMBER: usize = 16;
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
+type ControlPosition = (HWND, i32, i32, i32, i32);
 struct App {
     window: HWND,
     username: HWND,
@@ -62,7 +64,7 @@ struct App {
     building_page: Cell<Option<usize>>,
     building_advanced: Cell<bool>,
     advanced_controls: RefCell<Vec<HWND>>,
-    settings_positions: RefCell<Vec<(HWND, i32, i32, i32, i32)>>,
+    settings_positions: RefCell<Vec<ControlPosition>>,
     settings_pane: HWND,
     settings_scroll: i32,
     active_page: usize,
@@ -74,7 +76,9 @@ struct App {
     dashboard_values: [HWND; 6],
     state_title: HWND,
     state_icon: HWND,
+    palette: Palette,
     header_icon: HICON,
+    state_kind: Cell<u8>,
     title_font: HFONT,
     heading_font: HFONT,
     dpi: i32,
@@ -127,7 +131,9 @@ impl App {
             dashboard_values: [null_mut(); 6],
             state_title: null_mut(),
             state_icon: null_mut(),
+            palette: unsafe { Palette::system() },
             header_icon: null_mut(),
+            state_kind: Cell::new(0),
             title_font: null_mut(),
             heading_font: null_mut(),
             dpi: 96,
@@ -162,6 +168,24 @@ impl App {
         height: i32,
         id: usize,
     ) -> HWND {
+        let is_push = class == "BUTTON" && (style & BS_TYPEMASK as u32) <= BS_DEFPUSHBUTTON as u32;
+        let style = if is_push {
+            (style & !(BS_TYPEMASK as u32)) | BS_OWNERDRAW as u32
+        } else {
+            style
+        };
+        let style = if class == "BUTTON" {
+            style | BS_NOTIFY as u32
+        } else {
+            style
+        };
+        let field = class == "EDIT" && self.building_page.get() == Some(1);
+        let (x, y, width, height) = if field {
+            (x + 10, y + 5, width - 20, height - 10)
+        } else {
+            (x, y, width, height)
+        };
+        let style = if field { style & !WS_BORDER } else { style };
         let hwnd = CreateWindowExW(
             0,
             wide(class).as_ptr(),
@@ -198,91 +222,367 @@ impl App {
     fn px(&self, value: i32) -> i32 {
         (value * self.dpi + 48) / 96
     }
+    fn rect(&self, x: i32, y: i32, width: i32, height: i32, scroll: i32) -> RECT {
+        RECT {
+            left: self.px(x),
+            top: self.px(y) - scroll,
+            right: self.px(x + width),
+            bottom: self.px(y + height) - scroll,
+        }
+    }
+    unsafe fn paint(&self, hwnd: HWND, settings: bool) {
+        let mut ps: PAINTSTRUCT = std::mem::zeroed();
+        let dc = BeginPaint(hwnd, &mut ps);
+        let saved = SaveDC(dc);
+        let p = self.palette;
+        let mut area: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut area);
+        appearance::fill(dc, &area, if settings { p.surface } else { p.background });
+        if settings {
+            for (control, x, y, width, height) in [
+                (self.username, 170, 82, 394, 30),
+                (self.password, 170, 126, 394, 30),
+                (self.interval, 170, 356, 86, 30),
+                (self.gateway, 170, 454, 220, 30),
+            ] {
+                if control != self.gateway || self.advanced_expanded {
+                    appearance::rounded(
+                        dc,
+                        &self.rect(x, y, width, height, self.settings_scroll),
+                        self.px(8),
+                        p.surface,
+                        if GetFocus() == control {
+                            p.accent
+                        } else {
+                            p.border
+                        },
+                    );
+                }
+            }
+            let y = self.px(268) - self.settings_scroll;
+            appearance::line(dc, self.px(20), y, self.px(564), y, p.border);
+            if self.advanced_expanded {
+                let y = self.px(442) - self.settings_scroll;
+                appearance::line(dc, self.px(20), y, self.px(564), y, p.border);
+            }
+        } else if self.active_page == 0 {
+            for (y, height) in [(80, 98), (188, 166), (404, 100)] {
+                appearance::rounded(
+                    dc,
+                    &self.rect(32, y, 616, height, self.scroll),
+                    self.px(16),
+                    p.surface,
+                    p.border,
+                );
+            }
+            let x = self.px(340);
+            appearance::line(
+                dc,
+                x,
+                self.px(204) - self.scroll,
+                x,
+                self.px(338) - self.scroll,
+                p.border,
+            );
+        }
+        RestoreDC(dc, saved);
+        EndPaint(hwnd, &ps);
+    }
+    unsafe fn control_color(&self, dc: HDC, control: HWND, edit: bool) -> LRESULT {
+        let p = self.palette;
+        let prominent = control == self.state_title
+            || self.dashboard_values.contains(&control)
+            || SendMessageW(control, WM_GETFONT, 0, 0) == self.heading_font as isize;
+        SetTextColor(dc, if edit || prominent { p.text } else { p.muted });
+        let mut area: RECT = std::mem::zeroed();
+        GetWindowRect(control, &mut area);
+        MapWindowPoints(
+            null_mut(),
+            self.window,
+            &mut area as *mut RECT as *mut POINT,
+            2,
+        );
+        let y = area.top + self.scroll;
+        let card = GetParent(control) == self.settings_pane
+            || control == self.history
+            || edit
+            || (self.active_page == 0 && y >= self.px(80) && y < self.px(354));
+        let color = if card { p.surface } else { p.background };
+        SetBkColor(dc, color);
+        SetBkMode(dc, TRANSPARENT as i32);
+        appearance::brush(dc, color) as isize
+    }
+    unsafe fn draw_item(&self, item: &DRAWITEMSTRUCT) {
+        let dc = item.hDC;
+        let saved = SaveDC(dc);
+        let p = self.palette;
+        let mut rect = item.rcItem;
+        SetBkMode(dc, TRANSPARENT as i32);
+        if item.hwndItem == self.state_icon {
+            let color = match self.state_kind.get() {
+                1 => p.success,
+                2 => p.warning,
+                _ => p.accent,
+            };
+            let bg = if p.high_contrast { p.surface } else { p.soft };
+            appearance::fill(dc, &rect, p.surface);
+            appearance::rounded(dc, &rect, self.px(18), bg, bg);
+            // The symbol has a textual status alongside it, so color is never the only cue.
+            let pen = CreatePen(PS_SOLID, self.px(2).max(2), color);
+            let old_pen = SelectObject(dc, pen);
+            let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            let x = rect.left;
+            let y = rect.top;
+            match self.state_kind.get() {
+                1 => {
+                    MoveToEx(dc, x + self.px(12), y + self.px(24), null_mut());
+                    LineTo(dc, x + self.px(21), y + self.px(32));
+                    LineTo(dc, x + self.px(36), y + self.px(16));
+                }
+                2 => {
+                    MoveToEx(dc, x + self.px(24), y + self.px(12), null_mut());
+                    LineTo(dc, x + self.px(24), y + self.px(28));
+                    Ellipse(
+                        dc,
+                        x + self.px(23),
+                        y + self.px(34),
+                        x + self.px(26),
+                        y + self.px(37),
+                    );
+                }
+                3 => {
+                    for xx in [19, 29] {
+                        MoveToEx(dc, x + self.px(xx), y + self.px(15), null_mut());
+                        LineTo(dc, x + self.px(xx), y + self.px(34));
+                    }
+                }
+                _ => {
+                    Arc(
+                        dc,
+                        x + self.px(8),
+                        y + self.px(13),
+                        x + self.px(40),
+                        y + self.px(42),
+                        x + self.px(40),
+                        y + self.px(23),
+                        x + self.px(8),
+                        y + self.px(23),
+                    );
+                    Arc(
+                        dc,
+                        x + self.px(15),
+                        y + self.px(22),
+                        x + self.px(33),
+                        y + self.px(39),
+                        x + self.px(33),
+                        y + self.px(28),
+                        x + self.px(15),
+                        y + self.px(28),
+                    );
+                    Ellipse(
+                        dc,
+                        x + self.px(23),
+                        y + self.px(34),
+                        x + self.px(26),
+                        y + self.px(37),
+                    );
+                }
+            }
+            SelectObject(dc, old_brush);
+            SelectObject(dc, old_pen);
+            DeleteObject(pen);
+        } else {
+            let tab = item.hwndItem == self.tabs;
+            let selected = if tab {
+                item.itemID as usize == self.active_page
+            } else {
+                item.itemState & ODS_SELECTED != 0
+            };
+            let disabled = item.itemState & ODS_DISABLED != 0;
+            let primary = item.CtlID as usize == START || item.CtlID as usize == SETTINGS_START;
+            let background = if GetParent(item.hwndItem) == self.settings_pane {
+                p.surface
+            } else {
+                p.background
+            };
+            appearance::fill(dc, &rect, background);
+            let contrast_selected = p.high_contrast && tab && selected;
+            let fill = if disabled {
+                p.background
+            } else if primary || contrast_selected {
+                p.accent
+            } else if selected {
+                p.soft
+            } else {
+                p.surface
+            };
+            let border = if primary && !disabled {
+                p.accent
+            } else if tab && !selected {
+                background
+            } else {
+                p.border
+            };
+            if tab {
+                InflateRect(&mut rect, -self.px(2), -self.px(2));
+            }
+            appearance::rounded(dc, &rect, self.px(12), fill, border);
+            if selected && !tab {
+                OffsetRect(&mut rect, 0, self.px(1));
+            }
+            SetTextColor(
+                dc,
+                if disabled {
+                    GetSysColor(COLOR_GRAYTEXT)
+                } else if primary || contrast_selected {
+                    p.accent_text
+                } else if tab && selected {
+                    p.accent
+                } else {
+                    p.text
+                },
+            );
+            SelectObject(
+                dc,
+                if primary || (tab && selected) {
+                    self.heading_font
+                } else {
+                    self.font
+                },
+            );
+            let mut chars = [0u16; 256];
+            let len = if tab {
+                let label = if item.itemID == 0 {
+                    "连接仪表盘"
+                } else {
+                    "设置"
+                };
+                let mut count = 0;
+                for ch in label.encode_utf16() {
+                    chars[count] = ch;
+                    count += 1;
+                }
+                count as i32
+            } else {
+                GetWindowTextW(item.hwndItem, chars.as_mut_ptr(), chars.len() as i32)
+            };
+            DrawTextW(
+                dc,
+                chars.as_ptr(),
+                len,
+                &mut rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+            if item.itemState & ODS_FOCUS != 0 && item.itemState & ODS_NOFOCUSRECT == 0 {
+                InflateRect(&mut rect, -self.px(4), -self.px(4));
+                DrawFocusRect(dc, &rect);
+            }
+        }
+        RestoreDC(dc, saved);
+    }
+    unsafe fn paint_navigation(&self, hwnd: HWND) {
+        let mut ps: PAINTSTRUCT = std::mem::zeroed();
+        let dc = BeginPaint(hwnd, &mut ps);
+        let saved = SaveDC(dc);
+        let mut area: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut area);
+        let p = self.palette;
+        appearance::fill(dc, &area, p.background);
+        appearance::rounded(dc, &area, self.px(12), p.soft, p.soft);
+        SetBkMode(dc, TRANSPARENT as i32);
+        for (index, title) in ["连接仪表盘", "设置"].iter().enumerate() {
+            let mut rect: RECT = std::mem::zeroed();
+            SendMessageW(hwnd, TCM_GETITEMRECT, index, &mut rect as *mut _ as isize);
+            let selected = index == self.active_page;
+            if selected {
+                let fill = if p.high_contrast { p.accent } else { p.surface };
+                appearance::rounded(dc, &rect, self.px(10), fill, p.border);
+            }
+            SelectObject(
+                dc,
+                if selected {
+                    self.heading_font
+                } else {
+                    self.font
+                },
+            );
+            SetTextColor(
+                dc,
+                if selected && p.high_contrast {
+                    p.accent_text
+                } else if selected {
+                    p.accent
+                } else {
+                    p.muted
+                },
+            );
+            let title = wide(title);
+            DrawTextW(
+                dc,
+                title.as_ptr(),
+                -1,
+                &mut rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+            if selected
+                && GetFocus() == hwnd
+                && SendMessageW(hwnd, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS as isize == 0
+            {
+                InflateRect(&mut rect, -self.px(4), -self.px(4));
+                DrawFocusRect(dc, &rect);
+            }
+        }
+        RestoreDC(dc, saved);
+        EndPaint(hwnd, &ps);
+    }
     unsafe fn label(&self, text: &str, x: i32, y: i32, width: i32) -> HWND {
         self.control("STATIC", text, 0, x, y, width, 22, 0)
     }
     unsafe fn build(&mut self) {
         self.dpi = system_dpi();
-        let mut metrics: NONCLIENTMETRICSW = std::mem::zeroed();
-        metrics.cbSize = std::mem::size_of::<NONCLIENTMETRICSW>() as u32;
-        if SystemParametersInfoW(
-            SPI_GETNONCLIENTMETRICS,
-            metrics.cbSize,
-            &mut metrics as *mut _ as _,
-            0,
-        ) != 0
-        {
-            self.font = CreateFontIndirectW(&metrics.lfMessageFont);
-            let mut heading = metrics.lfMessageFont;
-            heading.lfWeight = FW_SEMIBOLD as i32;
-            self.heading_font = CreateFontIndirectW(&heading);
-            heading.lfHeight = -self.px(24);
-            self.title_font = CreateFontIndirectW(&heading);
-        } else {
-            self.font = CreateFontW(
-                -self.px(13),
+        // Explicit UI family avoids the classic bitmap/serif fallback on Chinese Windows.
+        // Three shared fonts, the same count as the previous UI.
+        for (slot, height, weight) in [
+            (&mut self.font, 14, FW_NORMAL),
+            (&mut self.heading_font, 15, FW_SEMIBOLD),
+            (&mut self.title_font, 24, FW_SEMIBOLD),
+        ] {
+            *slot = CreateFontW(
+                -(height * self.dpi / 96),
                 0,
                 0,
                 0,
-                FW_NORMAL as i32,
+                weight as i32,
                 0,
                 0,
                 0,
                 DEFAULT_CHARSET as u32,
-                0,
-                0,
-                0,
-                0,
-                wide("Segoe UI").as_ptr(),
-            );
-            self.heading_font = CreateFontW(
-                -self.px(13),
-                0,
-                0,
-                0,
-                FW_SEMIBOLD as i32,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET as u32,
-                0,
-                0,
-                0,
-                0,
-                wide("Segoe UI").as_ptr(),
-            );
-            self.title_font = CreateFontW(
-                -self.px(24),
-                0,
-                0,
-                0,
-                FW_SEMIBOLD as i32,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET as u32,
-                0,
-                0,
-                0,
-                0,
-                wide("Segoe UI").as_ptr(),
+                OUT_DEFAULT_PRECIS as u32,
+                CLIP_DEFAULT_PRECIS as u32,
+                CLEARTYPE_QUALITY as u32,
+                DEFAULT_PITCH as u32,
+                wide("Microsoft YaHei UI").as_ptr(),
             );
         }
-        let mut stock: SHSTOCKICONINFO = std::mem::zeroed();
-        stock.cbSize = std::mem::size_of_val(&stock) as u32;
-        if SHGetStockIconInfo(SIID_MYNETWORK, SHGSI_ICON | SHGSI_LARGEICON, &mut stock) >= 0 {
-            self.header_icon = stock.hIcon;
-        }
+        // Keep native tabs for keyboard/accessibility, draw only their small segmented header.
         self.tabs = self.control(
             "SysTabControl32",
             "",
-            WS_TABSTOP | WS_CLIPSIBLINGS,
-            20,
-            20,
-            640,
-            560,
+            WS_TABSTOP | WS_CLIPSIBLINGS | TCS_FIXEDWIDTH,
+            200,
+            22,
+            280,
+            38,
             PAGES,
         );
+        SetWindowTheme(self.tabs, wide("").as_ptr(), wide("").as_ptr());
+        SendMessageW(
+            self.tabs,
+            TCM_SETITEMSIZE,
+            0,
+            ((self.px(32) as isize) << 16) | self.px(134) as isize,
+        );
+        SendMessageW(self.tabs, TCM_SETPADDING, 0, 0);
         for (index, title) in ["连接仪表盘", "设置"].iter().enumerate() {
             let mut title = wide(title);
             let item = TCITEMW {
@@ -297,32 +597,39 @@ impl App {
                 &item as *const _ as isize,
             );
         }
+        SetWindowSubclass(
+            self.tabs,
+            Some(navigation_proc),
+            1,
+            self as *const _ as usize,
+        );
         self.settings_pane = CreateWindowExW(
             WS_EX_CONTROLPARENT,
             wide("BUAALoginSettingsPane").as_ptr(),
             wide("").as_ptr(),
             WS_CHILD | WS_VSCROLL | WS_CLIPCHILDREN,
-            self.px(40),
-            self.px(68),
-            self.px(600),
-            self.px(434),
+            self.px(32),
+            self.px(80),
+            self.px(616),
+            self.px(424),
             self.window,
             null_mut(),
             GetModuleHandleW(null()),
             self as *mut _ as _,
         );
         self.building_page.set(Some(0));
-        self.state_icon = self.control("STATIC", "", SS_ICON | SS_CENTERIMAGE, 48, 78, 48, 48, 0);
-        self.state_title = self.control("STATIC", "北航校园网", 0, 118, 72, 516, 36, 0);
+        self.state_icon = self.control("STATIC", "连接状态", SS_OWNERDRAW, 52, 98, 48, 48, 0);
+        self.state_title =
+            self.control("STATIC", "北航校园网", SS_ENDELLIPSIS, 120, 94, 504, 36, 0);
         SendMessageW(self.state_title, WM_SETFONT, self.title_font as usize, 1);
         self.status = self.control(
             "STATIC",
             "先在设置中填写账号，再开始自动重连。",
             0,
-            118,
-            112,
-            516,
-            64,
+            120,
+            135,
+            504,
+            36,
             0,
         );
         self.update_state("idle");
@@ -337,10 +644,11 @@ impl App {
         .iter()
         .enumerate()
         {
-            let x = 48 + (index as i32 % 2) * 300;
-            let y = 196 + (index as i32 / 2) * 56;
-            self.label(title, x, y, 280);
-            self.dashboard_values[index] = self.label("—", x, y + 24, 280);
+            let x = 52 + (index as i32 % 2) * 304;
+            let y = 201 + (index as i32 / 2) * 54;
+            self.label(title, x, y, 260);
+            self.dashboard_values[index] =
+                self.control("STATIC", "—", SS_ENDELLIPSIS, x, y + 23, 260, 24, 0);
             SendMessageW(
                 self.dashboard_values[index],
                 WM_SETFONT,
@@ -348,58 +656,58 @@ impl App {
                 1,
             );
         }
-        self.label("最近活动", 48, 368, 400);
+        let recent = self.label("最近活动", 32, 373, 300);
+        SendMessageW(recent, WM_SETFONT, self.heading_font as usize, 1);
         self.history_button = self.control(
             "BUTTON",
             "查看完整记录",
             WS_TABSTOP,
-            484,
-            362,
-            150,
-            28,
+            492,
+            368,
+            156,
+            30,
             HISTORY,
         );
         self.history = self.control(
             "EDIT",
             "暂无活动记录",
-            WS_BORDER
-                | ES_MULTILINE as u32
+            ES_MULTILINE as u32
                 | ES_READONLY as u32
                 | ES_AUTOVSCROLL as u32
                 | WS_VSCROLL
                 | WS_TABSTOP,
-            48,
-            400,
-            586,
-            100,
+            46,
+            415,
+            588,
+            74,
             0,
         );
         self.start = self.control(
             "BUTTON",
             "设置账号",
             BS_DEFPUSHBUTTON as u32 | WS_TABSTOP,
-            48,
-            530,
-            180,
             32,
+            530,
+            184,
+            38,
             START,
         );
-        self.stop = self.control("BUTTON", "停止", WS_TABSTOP, 242, 530, 86, 32, STOP);
+        self.stop = self.control("BUTTON", "停止", WS_TABSTOP, 228, 530, 88, 38, STOP);
         EnableWindow(self.stop, 0);
-        self.control("BUTTON", "收起至托盘", WS_TABSTOP, 482, 530, 152, 32, HIDE);
+        self.control("BUTTON", "收起至托盘", WS_TABSTOP, 492, 530, 156, 38, HIDE);
 
         self.building_page.set(Some(1));
-        let title = self.label("账号", 12, 4, 550);
+        let title = self.label("账号与启动", 20, 14, 560);
         SendMessageW(title, WM_SETFONT, self.heading_font as usize, 1);
-        self.label("用于登录校园网，凭据由 Windows 加密保存。", 12, 34, 550);
-        self.label("校园网账号", 12, 76, 550);
+        self.label("使用校园网账号登录，密码由 Windows 加密保存。", 20, 44, 560);
+        self.label("校园网账号", 20, 89, 140);
         self.username = self.control(
             "EDIT",
             "",
             WS_BORDER | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-            12,
-            102,
-            550,
+            170,
+            82,
+            394,
             30,
             20,
         );
@@ -409,14 +717,14 @@ impl App {
             0,
             wide("学号 / 工号").as_ptr() as isize,
         );
-        self.label("密码", 12, 152, 550);
+        self.label("校园网密码", 20, 133, 140);
         self.password = self.control(
             "EDIT",
             "",
             WS_BORDER | ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-            12,
-            178,
-            550,
+            170,
+            126,
+            394,
             30,
             21,
         );
@@ -430,9 +738,9 @@ impl App {
             "BUTTON",
             "记住账号密码",
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            12,
-            224,
-            550,
+            170,
+            170,
+            394,
             24,
             REMEMBER,
         );
@@ -440,32 +748,32 @@ impl App {
             "BUTTON",
             "开机自启",
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            12,
-            266,
-            550,
+            170,
+            204,
+            394,
             24,
             AUTOSTART,
         );
         self.control(
             "STATIC",
-            "登录系统后启动；需记住账号密码，保存完整配置后自动连接。",
+            "登录系统后自动连接，需先记住账号密码。",
             0,
-            12,
-            300,
-            550,
-            36,
+            170,
+            236,
+            394,
+            22,
             0,
         );
-        let title = self.label("连接", 12, 358, 550);
+        let title = self.label("连接", 20, 278, 550);
         SendMessageW(title, WM_SETFONT, self.heading_font as usize, 1);
-        self.label("校园网接口", 12, 400, 550);
+        self.label("校园网接口", 20, 318, 140);
         self.interfaces = self.control(
             "COMBOBOX",
             "",
             CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
-            12,
-            426,
-            374,
+            170,
+            312,
+            270,
             260,
             23,
         );
@@ -477,50 +785,50 @@ impl App {
         );
         SendMessageW(self.interfaces, CB_SETCURSEL, 0, 0);
         self.bindings = vec![None];
-        self.scan = self.control("BUTTON", "检测接口", WS_TABSTOP, 402, 426, 160, 28, SCAN);
-        self.label("检查间隔", 12, 476, 550);
+        self.scan = self.control("BUTTON", "检测接口", WS_TABSTOP, 452, 310, 112, 30, SCAN);
+        self.label("检查间隔", 20, 363, 140);
         self.interval = self.control(
             "EDIT",
             "300",
             WS_BORDER | ES_NUMBER as u32 | WS_TABSTOP,
-            12,
-            502,
-            100,
-            28,
+            170,
+            356,
+            86,
+            30,
             22,
         );
-        self.label("秒 · 最低 10 秒，失败时采用递增退避", 128, 508, 434);
+        self.label("秒 · 失败后逐步延长重试间隔", 272, 363, 292);
         self.control(
             "BUTTON",
             "展开高级选项",
             WS_TABSTOP,
-            12,
-            556,
-            170,
-            28,
+            20,
+            390,
+            154,
+            30,
             ADVANCED,
         );
         self.building_advanced.set(true);
-        self.label("网关地址", 12, 604, 550);
+        self.label("网关地址", 20, 460, 140);
         self.gateway = self.control(
             "EDIT",
             "10.200.21.4",
             WS_BORDER | WS_TABSTOP,
-            12,
-            630,
-            240,
-            28,
+            170,
+            454,
+            220,
+            30,
             24,
         );
-        self.label("通常无需修改", 268, 636, 294);
-        self.label("Wi-Fi 自动连接", 12, 682, 550);
+        self.label("通常无需修改", 406, 460, 158);
+        self.label("Wi-Fi 网卡", 20, 506, 140);
         self.wifi_adapter = self.control(
             "COMBOBOX",
             "",
             CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
-            12,
-            708,
-            550,
+            170,
+            500,
+            394,
             260,
             WIFI_ADAPTER,
         );
@@ -528,9 +836,9 @@ impl App {
             "BUTTON",
             "发现 BUAA-WiFi 自动连接",
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            12,
-            760,
-            550,
+            170,
+            546,
+            394,
             24,
             WIFI_AUTO,
         );
@@ -547,13 +855,13 @@ impl App {
             "BUTTON",
             "开始自动重连",
             WS_TABSTOP,
-            448,
+            462,
             530,
             186,
-            32,
+            38,
             SETTINGS_START,
         );
-        self.settings_hint = self.label("开始时保存并应用设置。", 48, 530, 386);
+        self.settings_hint = self.label("开始时保存并应用设置。", 32, 539, 410);
         self.page_controls
             .borrow_mut()
             .extend([(self.settings_start, 1), (self.settings_hint, 1)]);
@@ -564,11 +872,24 @@ impl App {
         self.tray.uID = 1;
         self.tray.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         self.tray.uCallbackMessage = TRAY;
+        self.header_icon = appearance::app_icon();
         self.tray.hIcon = if self.header_icon.is_null() {
-            LoadIconW(null_mut(), IDI_INFORMATION)
+            LoadIconW(null_mut(), IDI_APPLICATION)
         } else {
             self.header_icon
         };
+        SendMessageW(
+            self.window,
+            WM_SETICON,
+            ICON_BIG as usize,
+            self.tray.hIcon as isize,
+        );
+        SendMessageW(
+            self.window,
+            WM_SETICON,
+            ICON_SMALL as usize,
+            self.tray.hIcon as isize,
+        );
         self.tooltip("北航校园网 · 未启动");
         Shell_NotifyIconW(NIM_ADD, &self.tray);
         self.power = windows_sys::Win32::System::Power::RegisterSuspendResumeNotification(
@@ -589,24 +910,20 @@ impl App {
         }
     }
     unsafe fn update_state(&self, state: &str) {
-        let (title, icon) = match state {
-            "online" => ("校园网在线", IDI_INFORMATION),
-            "retry" => ("等待自动重试", IDI_WARNING),
-            "error" | "failed" => ("连接需要处理", IDI_WARNING),
-            "suspended" => ("睡眠期间暂停", IDI_INFORMATION),
-            "waiting_network" => ("等待网络", IDI_INFORMATION),
-            "checking" => ("正在检查连接", IDI_INFORMATION),
-            "interfaces" => ("接口检测完成", IDI_INFORMATION),
-            "stopped" => ("已停止自动重连", IDI_INFORMATION),
-            _ => ("北航校园网", IDI_INFORMATION),
+        let (title, kind) = match state {
+            "online" => ("校园网在线", 1),
+            "retry" => ("等待自动重试", 2),
+            "error" | "failed" => ("连接需要处理", 2),
+            "suspended" => ("睡眠期间暂停", 3),
+            "waiting_network" => ("等待网络", 0),
+            "checking" => ("正在检查连接", 0),
+            "interfaces" => ("接口检测完成", 1),
+            "stopped" => ("已停止自动重连", 3),
+            _ => ("北航校园网", 0),
         };
+        self.state_kind.set(kind);
         SetWindowTextW(self.state_title, wide(title).as_ptr());
-        SendMessageW(
-            self.state_icon,
-            STM_SETICON,
-            LoadIconW(null_mut(), icon) as usize,
-            0,
-        );
+        InvalidateRect(self.state_icon, null(), 0);
     }
     unsafe fn show_page(&mut self, index: usize) {
         self.active_page = index;
@@ -629,27 +946,8 @@ impl App {
         if index == 0 {
             self.render_history();
         }
-        SendMessageW(
-            self.start,
-            BM_SETSTYLE,
-            if index == 0 {
-                BS_DEFPUSHBUTTON
-            } else {
-                BS_PUSHBUTTON
-            } as usize,
-            1,
-        );
-        SendMessageW(
-            self.settings_start,
-            BM_SETSTYLE,
-            if index == 1 {
-                BS_DEFPUSHBUTTON
-            } else {
-                BS_PUSHBUTTON
-            } as usize,
-            1,
-        );
         SetFocus(self.tabs);
+        InvalidateRect(self.tabs, null(), 1);
         InvalidateRect(self.window, null(), 1);
     }
     unsafe fn toggle_history(&mut self) {
@@ -699,7 +997,7 @@ impl App {
             cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
             fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
             nMin: 0,
-            nMax: self.px(if self.advanced_expanded { 810 } else { 592 }) - 1,
+            nMax: self.px(if self.advanced_expanded { 594 } else { 424 }) - 1,
             nPage: (area.bottom - area.top).max(0) as u32,
             nPos: self.settings_scroll,
             nTrackPos: 0,
@@ -718,6 +1016,7 @@ impl App {
                 1,
             );
         }
+        InvalidateRect(self.settings_pane, null(), 0);
     }
     unsafe fn ensure_setting_visible(&mut self, field: HWND) {
         let position = self
@@ -1456,6 +1755,32 @@ fn local_time(timestamp: Option<u64>) -> String {
     }
     "—".into()
 }
+unsafe extern "system" fn navigation_proc(
+    hwnd: HWND,
+    message: u32,
+    w: WPARAM,
+    l: LPARAM,
+    id: usize,
+    data: usize,
+) -> LRESULT {
+    if let Some(app) = (data as *const App).as_ref() {
+        match message {
+            WM_PAINT => {
+                app.paint_navigation(hwnd);
+                return 0;
+            }
+            WM_ERASEBKGND => return 1,
+            WM_SETFOCUS | WM_KILLFOCUS | WM_UPDATEUISTATE => {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            WM_NCDESTROY => {
+                RemoveWindowSubclass(hwnd, Some(navigation_proc), id);
+            }
+            _ => {}
+        }
+    }
+    DefSubclassProc(hwnd, message, w, l)
+}
 unsafe extern "system" fn settings_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     if message == WM_NCCREATE {
         let create = &*(l as *const CREATESTRUCTW);
@@ -1464,8 +1789,23 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, message: u32, w: WPARAM, l: 
     let app = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App).as_mut();
     if let Some(app) = app {
         match message {
+            WM_PAINT => {
+                app.paint(hwnd, true);
+                return 0;
+            }
+            WM_ERASEBKGND => return 1,
+            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN | WM_CTLCOLORLISTBOX
+            | WM_DRAWITEM => {
+                return SendMessageW(app.window, message, w, l);
+            }
             WM_COMMAND => {
                 let notification = (w >> 16) as u32;
+                if notification == EN_SETFOCUS || notification == EN_KILLFOCUS {
+                    InvalidateRect(hwnd, null(), 0);
+                }
+                if notification == BN_SETFOCUS {
+                    app.ensure_setting_visible(l as HWND);
+                }
                 if notification == EN_SETFOCUS || notification == CBN_SETFOCUS {
                     app.ensure_setting_visible(l as HWND);
                 }
@@ -1515,6 +1855,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 app.build();
                 return 0;
             }
+            WM_PAINT => {
+                app.paint(hwnd, false);
+                return 0;
+            }
+            WM_ERASEBKGND => return 1,
+            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+                return app.control_color(w as HDC, l as HWND, false);
+            }
+            WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+                return app.control_color(w as HDC, l as HWND, true);
+            }
+            WM_DRAWITEM => {
+                app.draw_item(&*(l as *const DRAWITEMSTRUCT));
+                return 1;
+            }
+            WM_SYSCOLORCHANGE | WM_THEMECHANGED | WM_SETTINGCHANGE => {
+                app.palette = Palette::system();
+                RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_ALLCHILDREN);
+            }
             WM_NOTIFY => {
                 let notification = &*(l as *const NMHDR);
                 if notification.hwndFrom == app.tabs && notification.code == TCN_SELCHANGE {
@@ -1532,13 +1891,34 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 return ((DC_HASDEFID as usize) << 16 | id) as isize;
             }
             WM_COMMAND => {
+                let id = w & 0xffff;
+                // Owner-draw/BS_NOTIFY buttons also send focus and double-click notices.
+                // Only a click may start work or mutate settings.
+                if l != 0
+                    && [
+                        START,
+                        STOP,
+                        SCAN,
+                        HIDE,
+                        REMEMBER,
+                        ADVANCED,
+                        HISTORY,
+                        SETTINGS_START,
+                        AUTOSTART,
+                        WIFI_AUTO,
+                    ]
+                    .contains(&id)
+                    && w >> 16 != BN_CLICKED as usize
+                {
+                    return 0;
+                }
                 match w & 0xffff {
                     START => app.dashboard_action(),
                     SETTINGS_START => app.start_worker(false),
                     ADVANCED => app.toggle_advanced(),
                     HISTORY => app.toggle_history(),
                     AUTOSTART => app.startup_changed(),
-                    20 | 21 | 22 if w >> 16 == EN_CHANGE as usize => app.update_start_title(),
+                    20..=22 if w >> 16 == EN_CHANGE as usize => app.update_start_title(),
                     STOP => app.stop_worker(),
                     SCAN => app.start_worker(true),
                     HIDE => {
@@ -1752,7 +2132,8 @@ pub fn run() {
         RegisterClassW(&pane_class);
         let mut app = Box::new(App::new());
         let dpi = system_dpi();
-        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VSCROLL;
+        let style =
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VSCROLL | WS_CLIPCHILDREN;
         let mut frame = RECT {
             left: 0,
             top: 0,
@@ -1805,6 +2186,21 @@ pub fn run() {
         }
         let mut message: MSG = std::mem::zeroed();
         while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
+            // IsDialogMessage does not recognise an owner-draw button as a default
+            // pushbutton. Enter must activate the focused action, not another page action.
+            if message.message == WM_KEYDOWN && message.wParam == 13 {
+                let focus = GetFocus();
+                let parent = GetParent(focus);
+                let owner_draw = GetWindowLongPtrW(focus, GWL_STYLE) as u32 & BS_TYPEMASK as u32
+                    == BS_OWNERDRAW as u32;
+                if (parent == window || parent == app.settings_pane)
+                    && owner_draw
+                    && windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(focus) != 0
+                {
+                    SendMessageW(focus, BM_CLICK, 0, 0);
+                    continue;
+                }
+            }
             if IsDialogMessageW(window, &message) == 0 {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
