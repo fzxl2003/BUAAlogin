@@ -2,6 +2,8 @@
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
+mod appearance;
+#[cfg(windows)]
 mod autostart;
 #[cfg(windows)]
 mod wifi;
