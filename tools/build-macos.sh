@@ -12,7 +12,7 @@ mkdir -p "$app/Contents/MacOS" releases
 cp platform/macos/Info.plist "$app/Contents/Info.plist"
 swiftc -target arm64-apple-macos12 -O -import-objc-header platform/macos/BUAACore.h \
   platform/macos/main.swift platform/macos/WiFi.swift platform/macos/AutoStart.swift target/release/libbuaa_core.a \
-  -framework AppKit -framework ServiceManagement -framework Security -framework SystemConfiguration -framework CoreWLAN -framework CoreLocation -lcurl \
+  -framework AppKit -framework ServiceManagement -framework SystemConfiguration -framework CoreWLAN -framework CoreLocation -lcurl \
   -o "$app/Contents/MacOS/BUAALogin"
 codesign --force --sign - "$app"
 codesign --verify --deep --strict "$app"

@@ -11,7 +11,7 @@ mod scheduler;
 pub mod transport;
 
 use serde::{Deserialize, Serialize};
-use std::net::Ipv4Addr;
+use std::{collections::HashMap, net::Ipv4Addr};
 use zeroize::Zeroizing;
 
 #[derive(Clone, Deserialize)]
@@ -20,7 +20,12 @@ pub struct Config {
     pub username: String,
     pub password: Zeroizing<String>,
     pub interface: Option<String>,
+    /// Empty means automatic selection. This coexists with `interface` for
+    /// backwards compatibility with older settings and the CLI.
+    pub interfaces: Vec<String>,
     pub gateway_ip: Ipv4Addr,
+    /// Optional gateway overrides keyed by interface binding/name/address.
+    pub interface_gateways: HashMap<String, Ipv4Addr>,
     pub interval: u64,
     pub try_all: bool,
     /// macOS supplies a single-shot GCD timer instead of a worker timeout.
@@ -36,7 +41,9 @@ impl Default for Config {
             username: String::new(),
             password: Zeroizing::new(String::new()),
             interface: None,
+            interfaces: Vec::new(),
             gateway_ip: Ipv4Addr::new(10, 200, 21, 4),
+            interface_gateways: HashMap::new(),
             interval: 300,
             try_all: false,
             external_timer: false,
@@ -75,6 +82,19 @@ pub struct TaskSnapshots {
     pub browser_fallback: TaskSnapshot,
 }
 impl Config {
+    pub fn monitors_all_selected(&self) -> bool {
+        self.try_all || self.interfaces.len() > 1
+    }
+
+    pub fn gateway_for(&self, interface: &interfaces::Interface) -> Ipv4Addr {
+        self.interface_gateways
+            .get(&interface.binding())
+            .or_else(|| self.interface_gateways.get(&interface.name))
+            .or_else(|| self.interface_gateways.get(&interface.address.to_string()))
+            .copied()
+            .unwrap_or(self.gateway_ip)
+    }
+
     pub fn validate(&self, credentials: bool) -> Result<(), String> {
         if credentials
             && (self.portal_auth_enabled || self.browser_fallback)
@@ -119,6 +139,7 @@ pub struct DashboardSnapshot {
     pub interface: Option<String>,
     pub local_ip: Option<Ipv4Addr>,
     pub campus_ip: Option<String>,
+    pub traffic_used_bytes: Option<u64>,
     pub last_check_at: Option<u64>,
     pub retry_at: Option<u64>,
     pub interval: u64,

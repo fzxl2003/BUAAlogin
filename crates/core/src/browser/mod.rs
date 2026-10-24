@@ -20,7 +20,11 @@ pub(crate) fn recover(
     let cancel = cancel.with_timeout(Duration::from_secs(90));
     cancel.check()?;
     let executable = find_browser(config.browser_path.as_deref())?;
-    let proxy = proxy::Proxy::start(interface.clone(), config.gateway_ip, cancel.clone())?;
+    let proxy = proxy::Proxy::start(
+        interface.clone(),
+        config.gateway_for(interface),
+        cancel.clone(),
+    )?;
     cancel.check()?;
     let mut browser = Browser::launch(&executable, Some(proxy.address))?;
     let mut cdp = browser.connect(&cancel, "https://gw.buaa.edu.cn")?;

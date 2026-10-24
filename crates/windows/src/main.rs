@@ -5,6 +5,8 @@ mod app;
 mod appearance;
 #[cfg(windows)]
 mod autostart;
+#[cfg(any(windows, test))]
+mod credentials;
 #[cfg(windows)]
 mod wifi;
 fn main() {

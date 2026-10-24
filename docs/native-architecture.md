@@ -66,6 +66,6 @@ macOS 使用 CWWiFiClient 的扫描缓存、SSID、链路和电源通知，在 u
 
 ## 构建与回退
 
-构建脚本只打包原生程序，从独立 staging 目录生成 macOS app，避免混入其他构建产物。Windows 内嵌 asInvoker／系统 DPI／原生控件 manifest。凭据标识使用新的 native/v1 命名空间，与旧钥匙串及 DPAPI 文件隔离。
+构建脚本只打包原生程序，从独立 staging 目录生成 macOS app，避免混入其他构建产物。Windows 内嵌 asInvoker／系统 DPI／原生控件 manifest。两端凭据使用带随机扰动和完整性校验的应用内轻量加密格式，与旧钥匙串及 DPAPI 文件隔离；它用于避免明文存储，不提供系统级凭据保护。
 
 默认 CI 发布预览版，`promote_native` 只用于完成验收后的正式替换。发布前检查两个桌面包及两种 Linux 架构；仓库已移除所有 Python 旧实现及旧打包目录；回退使用之前发布的发行版或 Git 提交。

@@ -361,6 +361,7 @@ fn emit_dashboard(
         interface: current.map(|(i, _)| i.name.clone()),
         local_ip: current.map(|(i, _)| i.address),
         campus_ip: current.and_then(|(_, s)| s.session.campus_ip().map(str::to_owned)),
+        traffic_used_bytes: current.and_then(|(_, s)| s.session.traffic_used_bytes()),
         last_check_at: current.and_then(|(_, s)| s.last_check_at),
         retry_at: if matches!(phase, "retry" | "suspect" | "cooldown") {
             current.and_then(|(_, s)| s.retry_at)
@@ -397,7 +398,7 @@ fn refresh(
 ) {
     match interfaces::discover(config.try_all) {
         Ok(mut records) => {
-            records.retain(|i| i.selected(&config.interface));
+            records.retain(|i| i.selected(config));
             slots.retain(|i, _| records.contains(i));
             for i in records {
                 if slots.contains_key(&i) {
@@ -503,7 +504,7 @@ fn run_once(
                 ),
             );
         }
-        if campus && !config.try_all && !matches!(mode, Mode::Inspect) {
+        if campus && !config.monitors_all_selected() && !matches!(mode, Mode::Inspect) {
             break;
         }
     }
@@ -534,7 +535,7 @@ fn run(
         let candidates = match interfaces::discover(config.try_all) {
             Ok(v) => v
                 .into_iter()
-                .filter(|i| i.selected(&config.interface))
+                .filter(|i| i.selected(config))
                 .collect::<Vec<_>>(),
             Err(e) => {
                 let event = if let Mode::Test(kind) = mode {
@@ -620,7 +621,7 @@ fn run(
                     i.address,
                 )
             });
-            if !config.try_all {
+            if !config.monitors_all_selected() {
                 if let Some(p) = selected {
                     candidates.retain(|i| i == &p);
                 }
@@ -703,7 +704,7 @@ fn run(
                     emit_safe(emit, &config, event);
                     slot.reported = Some(key);
                 }
-                if slot.online && !config.try_all {
+                if slot.online && !config.monitors_all_selected() {
                     break;
                 }
             }
@@ -719,7 +720,9 @@ fn run(
             slots
                 .iter()
                 .filter(|(i, _)| {
-                    config.try_all || preferred_online.is_none() || preferred_online == Some(*i)
+                    config.monitors_all_selected()
+                        || preferred_online.is_none()
+                        || preferred_online == Some(*i)
                 })
                 .map(|(_, s)| s.due)
                 .min()
@@ -1237,7 +1240,7 @@ fn check_connection(
         .campus_ip()
         .map(str::to_owned)
         .unwrap_or_else(|| format!("interface:{}:{}", interface.name, interface.address));
-    let exit = book.exit(config.gateway_ip, &campus);
+    let exit = book.exit(config.gateway_for(interface), &campus);
     if report.available() && manual.is_none() && test.is_none() {
         exit.healthy();
         if slot.browser_enabled {
@@ -1329,6 +1332,7 @@ fn check_connection(
         interface: Some(interface.name.clone()),
         local_ip: Some(interface.address),
         campus_ip: slot.session.campus_ip().map(str::to_owned),
+        traffic_used_bytes: slot.session.traffic_used_bytes(),
         last_check_at: Some(unix_now()),
         retry_at: None,
         interval: config.interval,

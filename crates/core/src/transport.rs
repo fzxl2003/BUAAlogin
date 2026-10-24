@@ -248,6 +248,7 @@ pub struct Session {
     easy: Easy2<Transfer>,
     ip: Option<String>,
     acid: Option<String>,
+    traffic_used_bytes: Option<u64>,
     generation: Arc<AtomicU64>,
     active_generation: u64,
     request_deadline: Option<crate::cancellation::Cancellation>,
@@ -283,7 +284,10 @@ impl Session {
             easy.tcp_keepalive(false)?;
             easy.signal(false)?;
             let mut hosts = List::new();
-            hosts.append(&format!("gw.buaa.edu.cn:443:{}", config.gateway_ip))?;
+            hosts.append(&format!(
+                "gw.buaa.edu.cn:443:{}",
+                config.gateway_for(&interface)
+            ))?;
             easy.resolve(hosts)?;
             Ok(())
         })();
@@ -293,6 +297,7 @@ impl Session {
             easy,
             ip: None,
             acid: None,
+            traffic_used_bytes: None,
             active_generation: generation.load(Ordering::SeqCst),
             generation,
             request_deadline: None,
@@ -462,6 +467,10 @@ impl Session {
     pub fn activate(&mut self) {
         self.active_generation = self.generation.load(Ordering::SeqCst);
     }
+
+    pub fn traffic_used_bytes(&self) -> Option<u64> {
+        self.traffic_used_bytes
+    }
 }
 pub fn validate_url(url: &Url) -> Result<(), String> {
     if url.scheme() != "https"
@@ -525,6 +534,9 @@ impl Portal for Session {
     }
     fn online(&mut self) -> Result<bool, String> {
         let data = self.api("/cgi-bin/rad_user_info", &[])?;
+        self.traffic_used_bytes = parse_byte_count(&data["sum_bytes"])
+            .or_else(|| parse_byte_count(&data["used_bytes"]))
+            .or_else(|| parse_byte_count(&data["flow"]));
         Ok(data["error"] == "ok"
             && data["online_ip"]
                 .as_str()
@@ -544,6 +556,17 @@ impl Portal for Session {
         self.submit_login(username, password)
     }
 }
+fn parse_byte_count(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .and_then(|text| text.parse::<f64>().ok())
+            .filter(|number| number.is_finite() && *number >= 0.0 && *number <= u64::MAX as f64)
+            .map(|number| number as u64)
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,6 +581,13 @@ mod tests {
         ] {
             assert!(validate_url(&Url::parse(url).unwrap()).is_err());
         }
+    }
+    #[test]
+    fn traffic_byte_counts_accept_portal_number_formats() {
+        assert_eq!(parse_byte_count(&serde_json::json!(1234)), Some(1234));
+        assert_eq!(parse_byte_count(&serde_json::json!("5678")), Some(5678));
+        assert_eq!(parse_byte_count(&serde_json::json!("12.9")), Some(12));
+        assert_eq!(parse_byte_count(&serde_json::json!(-1)), None);
     }
     fn fixture(bodies: &[&str]) -> Session {
         let i = Interface {

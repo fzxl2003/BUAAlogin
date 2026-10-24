@@ -18,10 +18,17 @@ pub struct InterfaceRecord {
     pub campus_ip: Option<String>,
 }
 impl Interface {
-    pub fn selected(&self, selection: &Option<String>) -> bool {
-        selection
-            .as_ref()
-            .is_none_or(|s| s == &self.name || s == &self.address.to_string())
+    pub fn selected(&self, config: &crate::Config) -> bool {
+        let matches = |selection: &String| {
+            selection == &self.name
+                || selection == &self.address.to_string()
+                || selection == &self.binding()
+        };
+        if config.interfaces.is_empty() {
+            config.interface.as_ref().is_none_or(matches)
+        } else {
+            config.interfaces.iter().any(matches)
+        }
     }
     pub fn eligible(&self, virtuals: bool) -> bool {
         let lower = self.name.to_lowercase();
@@ -358,8 +365,13 @@ mod tests {
             address: "10.1.2.3".parse().unwrap(),
             index: 2,
         };
-        assert!(i.selected(&Some("en0".into())));
-        assert!(!i.selected(&Some("en1".into())));
+        let mut config = crate::Config::default();
+        config.interface = Some("en0".into());
+        assert!(i.selected(&config));
+        config.interface = Some("en1".into());
+        assert!(!i.selected(&config));
+        config.interfaces = vec!["en1".into(), "en0".into()];
+        assert!(i.selected(&config));
         let vpn = Interface {
             name: "utun0".into(),
             ..i

@@ -12,7 +12,6 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
-    Security::Cryptography::*,
     System::{
         LibraryLoader::*,
         SystemInformation::GetLocalTime,
@@ -801,7 +800,12 @@ impl App {
         self.building_page.set(Some(1));
         let title = self.label("账号与启动", 20, 14, 560);
         SendMessageW(title, WM_SETFONT, self.heading_font as usize, 1);
-        self.label("使用校园网账号登录，密码由 Windows 加密保存。", 20, 44, 560);
+        self.label(
+            "使用校园网账号登录，密码由应用内轻量加密保存。",
+            20,
+            44,
+            560,
+        );
         self.label("校园网账号", 20, 89, 140);
         self.username = self.control(
             "EDIT",
@@ -1952,9 +1956,9 @@ impl App {
         )?;
         if SendMessageW(self.remember, BM_GETCHECK, 0, 0) == BST_CHECKED as isize {
             let mut bytes = serde_json::to_vec(&serde_json::json!({"username":config.username,"password":config.password.as_str()})).unwrap();
-            let encrypted = protect(&mut bytes, false);
+            let encrypted = crate::credentials::encrypt(&bytes);
             bytes.fill(0);
-            atomic_write(&path, &encrypted?)?;
+            atomic_write(&path, &encrypted)?;
         } else if path.exists() {
             std::fs::remove_file(path).map_err(|_| "无法删除凭据")?;
         }
@@ -2010,7 +2014,7 @@ impl App {
             }
         }
         if let Ok(mut bytes) = std::fs::read(&path) {
-            match protect(&mut bytes, true) {
+            match crate::credentials::decrypt(&bytes) {
                 Ok(mut plain) => {
                     if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&plain) {
                         SetWindowTextW(
@@ -2031,7 +2035,7 @@ impl App {
                     }
                     plain.fill(0);
                 }
-                Err(_) => self.record("原生版凭据无法解密，请重新输入"),
+                Err(_) => self.record("应用内凭据无法解密，请重新输入"),
             }
         }
         self.update_start_title();
@@ -2050,7 +2054,7 @@ fn wifi_path() -> Result<PathBuf, String> {
 fn credential_path() -> Result<PathBuf, String> {
     Ok(
         PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("用户目录不可用")?)
-            .join("BUAALoginNative/v1/credentials.dpapi"),
+            .join("BUAALoginNative/v1/credentials.dat"),
     )
 }
 fn log_folder() -> Result<PathBuf, String> {
@@ -2113,42 +2117,6 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
         return Err("无法替换配置文件".into());
     }
     Ok(())
-}
-unsafe fn protect(bytes: &mut [u8], decrypt: bool) -> Result<Vec<u8>, String> {
-    let input = CRYPT_INTEGER_BLOB {
-        cbData: bytes.len() as u32,
-        pbData: bytes.as_mut_ptr(),
-    };
-    let mut output: CRYPT_INTEGER_BLOB = std::mem::zeroed();
-    let result = if decrypt {
-        CryptUnprotectData(
-            &input,
-            null_mut(),
-            null(),
-            null(),
-            null(),
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &mut output,
-        )
-    } else {
-        CryptProtectData(
-            &input,
-            wide("BUAALoginNative v1").as_ptr(),
-            null(),
-            null(),
-            null(),
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &mut output,
-        )
-    };
-    if result == 0 {
-        return Err("无法处理当前用户加密凭据".into());
-    }
-    let slice = std::slice::from_raw_parts_mut(output.pbData, output.cbData as usize);
-    let out = slice.to_vec();
-    slice.fill(0);
-    LocalFree(output.pbData as _);
-    Ok(out)
 }
 fn unix_now() -> u64 {
     std::time::SystemTime::now()

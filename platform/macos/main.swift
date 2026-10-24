@@ -1,10 +1,11 @@
 import AppKit
 import Darwin
-import Security
 import SystemConfiguration
 
-private let credentialService = "cn.buaa.autologin.native.v1.credentials"
 private let settingsKey = "cn.buaa.autologin.native.v1.settings"
+private let credentialStorageKey = "cn.buaa.autologin.native.v2.credentials"
+private let credentialMagic = Data("BUAACRED2".utf8)
+private let credentialSecret = Array("BUAALogin/native/local/credential/v2".utf8)
 
 private final class CallbackContext {
     weak var controller: Controller?
@@ -22,35 +23,48 @@ private let coreCallback: BuaaCallback = { pointer, json in
         controller.receive(event)
     }
 }
-private func credentialQuery() -> [String: Any] {
-    [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: credentialService]
+private func credentialHash(_ bytes: [UInt8]) -> UInt64 {
+    var hash: UInt64 = 0xcbf29ce484222325
+    for byte in credentialSecret + bytes {
+        hash ^= UInt64(byte); hash = hash &* 0x100000001b3
+    }
+    return hash
+}
+private func credentialTransform(_ bytes: [UInt8], nonce: [UInt8]) -> [UInt8] {
+    var state = credentialHash(nonce) | 1
+    return bytes.map { byte in
+        state ^= state << 13; state ^= state >> 7; state ^= state << 17
+        return byte ^ UInt8(truncatingIfNeeded: state)
+    }
+}
+private func credentialError() -> NSError {
+    NSError(domain: "BUAALoginCredentials", code: 1, userInfo: [NSLocalizedDescriptionKey: "应用内凭据数据无效"])
 }
 private func saveCredentials(_ username: String, _ password: String) throws {
-    let values: [String: Any] = [kSecAttrAccount as String: username, kSecValueData as String: Data(password.utf8)]
-    var status = SecItemUpdate(credentialQuery() as CFDictionary, values as CFDictionary)
-    if status == errSecItemNotFound {
-        var query = credentialQuery(); values.forEach { query[$0.key] = $0.value }
-        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        status = SecItemAdd(query as CFDictionary, nil)
-    }
-    if status != errSecSuccess { throw NSError(domain: NSOSStatusErrorDomain, code: Int(status)) }
+    let plain = try JSONSerialization.data(withJSONObject: ["username": username, "password": password])
+    let nonce = (0..<16).map { _ in UInt8.random(in: .min ... .max) }
+    var blob = credentialMagic
+    blob.append(contentsOf: nonce)
+    let tag = credentialHash(Array(plain))
+    for shift in stride(from: 0, to: 64, by: 8) { blob.append(UInt8(truncatingIfNeeded: tag >> UInt64(shift))) }
+    blob.append(contentsOf: credentialTransform(Array(plain), nonce: nonce))
+    UserDefaults.standard.set(blob, forKey: credentialStorageKey)
 }
 private func loadCredentials() throws -> (String, String)? {
-    var query = credentialQuery()
-    query[kSecReturnAttributes as String] = true; query[kSecReturnData as String] = true
-    query[kSecMatchLimit as String] = kSecMatchLimitOne
-    var result: CFTypeRef?
-    let status = SecItemCopyMatching(query as CFDictionary, &result)
-    if status == errSecItemNotFound { return nil }
-    guard status == errSecSuccess, let item = result as? [String: Any],
-          let username = item[kSecAttrAccount as String] as? String,
-          let data = item[kSecValueData as String] as? Data, let password = String(data: data, encoding: .utf8)
-    else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(status)) }
+    guard let blob = UserDefaults.standard.data(forKey: credentialStorageKey) else { return nil }
+    let prefix = credentialMagic.count
+    guard blob.count >= prefix + 24, blob.prefix(prefix) == credentialMagic else { throw credentialError() }
+    let bytes = Array(blob), nonce = Array(bytes[prefix..<(prefix + 16)])
+    var storedTag: UInt64 = 0
+    for (index, byte) in bytes[(prefix + 16)..<(prefix + 24)].enumerated() { storedTag |= UInt64(byte) << UInt64(index * 8) }
+    let plain = credentialTransform(Array(bytes[(prefix + 24)...]), nonce: nonce)
+    guard credentialHash(plain) == storedTag,
+          let object = try JSONSerialization.jsonObject(with: Data(plain)) as? [String: String],
+          let username = object["username"], let password = object["password"] else { throw credentialError() }
     return (username, password)
 }
 private func forgetCredentials() throws {
-    let status = SecItemDelete(credentialQuery() as CFDictionary)
-    if status != errSecSuccess && status != errSecItemNotFound { throw NSError(domain: NSOSStatusErrorDomain, code: Int(status)) }
+    UserDefaults.standard.removeObject(forKey: credentialStorageKey)
 }
 
 private final class FlippedContent: NSView {
@@ -65,15 +79,28 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
     private var store: SCDynamicStore?
     private var source: CFRunLoopSource?
     private let wifi = CampusWiFi()
-    private var wifiEnabled = Set<String>()
+    private var wifiNetworks: [String: Set<String>] = [:]
     private var wifiPanel: NSPanel?
     private var connectionPanel: NSPanel?
+    private var accountPanel: NSPanel?
+    private var interfaceDetailPanel: NSPanel?
+    private var trafficPanel: NSPanel?
     private var intervalPanel: NSPanel?
     private var wifiRows: [NSButton] = []
     private var monitoring = false
     private var closing = false
     private var scanning = false
-    private var selectionBindings: [String?] = [nil]
+    private var interfaceRecords: [[String: Any]] = []
+    private var selectedBindings = Set<String>()
+    private var interfaceGateways: [String: String] = [:]
+    private var interfaceRows: [NSButton] = []
+    private var detailBinding: String?
+    private var detailInterfaceName: String?
+    private let detailGateway = NSTextField(string: "")
+    private let wifiDefault = NSButton(checkboxWithTitle: "BUAA-WiFi", target: nil, action: nil)
+    private let wifiFree = NSButton(checkboxWithTitle: "BUAA-WiFi-Free", target: nil, action: nil)
+    private let wifiCustomEnabled = NSButton(checkboxWithTitle: "自定义 Wi-Fi 名称", target: nil, action: nil)
+    private let wifiCustomName = NSTextField(string: "")
     private var observers: [NSObjectProtocol] = []
     private let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 700),
         styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
@@ -84,8 +111,8 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
     private let intervalSettings = NSButton(title: "设置", target: nil, action: nil)
     private let intervalError = NSTextField(labelWithString: "")
     private let gateway = NSTextField(string: "10.200.21.4")
-    private let interfaces = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let remember = NSButton(checkboxWithTitle: "记住账号密码（系统钥匙串）", target: nil, action: nil)
+    private let interfaceList = FlippedContent(frame: .zero)
+    private let remember = NSButton(checkboxWithTitle: "记住账号密码（应用内加密）", target: nil, action: nil)
     private let start = NSButton(title: "开始自动连接", target: nil, action: nil)
     private let browserFallback = NSButton(checkboxWithTitle: "协议恢复失败后自动使用后台网页兜底", target: nil, action: nil)
     private let portalAuth = NSButton(checkboxWithTitle: "校园网认证（普通连接）", target: nil, action: nil)
@@ -102,16 +129,24 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
     private let history = NSTextView()
     private let historyScroll = NSScrollView()
     private let pages = NSTabView()
-    private let navigation = NSSegmentedControl(labels: ["连接", "账号设置"], trackingMode: .selectOne, target: nil, action: nil)
+    private let navigation = NSSegmentedControl(labels: ["连接", "设置"], trackingMode: .selectOne, target: nil, action: nil)
     private let launchAtLogin = NSButton(checkboxWithTitle: "开机自启", target: nil, action: nil)
     private let launchHint = NSTextField(wrappingLabelWithString: "登录系统后启动；保存完整配置和密码后自动连接。")
     private let loginSettings = NSButton(title: "打开系统登录项设置…", target: nil, action: nil)
     private let settingsScroll = NSScrollView()
     private let settingsForm = FlippedContent(frame: .zero)
-    private let advancedSection = FlippedContent(frame: .zero)
-    private let advancedButton = NSButton()
     private let settingsHint = NSTextField(labelWithString: "开始时保存并应用设置。")
     private var dashboardValues: [NSTextField] = []
+    private let accountButton = NSButton(title: "设置…", target: nil, action: nil)
+    private let interfaceButton = NSButton(title: "接口设置…", target: nil, action: nil)
+    private let trafficProgress = NSProgressIndicator()
+    private let trafficLabel = NSTextField(labelWithString: "尚未获取流量")
+    private let trafficTotal = NSTextField(string: "")
+    private let trafficSettings = NSButton(title: "设置总流量…", target: nil, action: nil)
+    private let trafficSettingsSummary = NSTextField(labelWithString: "未设置总流量")
+    private let trafficError = NSTextField(labelWithString: "")
+    private var trafficUsedBytes: UInt64?
+    private var trafficTotalBeforeEditing = ""
     private let stateIcon = NSImageView()
     private let stateTitle = NSTextField(labelWithString: "尚未开始")
     private let authBadge = NSTextField(labelWithString: "● 未知")
@@ -153,12 +188,12 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         }
         navigation.segmentStyle = .rounded; navigation.selectedSegment = 0
         navigation.target = self; navigation.action = #selector(selectPage)
-        navigation.setWidth(150, forSegment: 0); navigation.setWidth(100, forSegment: 1)
+        navigation.setWidth(130, forSegment: 0); navigation.setWidth(130, forSegment: 1)
         place(navigation, in: content, 207, 20, 266, 30)
         pages.tabViewType = .noTabsNoBorder
         place(pages, in: content, 32, 76, 616, 592)
         var views: [NSView] = []
-        for name in ["连接", "账号设置"] {
+        for name in ["连接", "设置"] {
             let page = FlippedContent(frame: NSRect(x: 0, y: 0, width: 616, height: 592))
             let item = NSTabViewItem(identifier: name); item.label = name; item.view = page
             pages.addTabViewItem(item); views.append(page)
@@ -168,37 +203,48 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         place(stateIcon, in: overview, 12, 4, 56, 56)
         stateTitle.font = .systemFont(ofSize: 22, weight: .semibold)
         place(stateTitle, in: overview, 88, 0, 528, 32)
-        authBadge.font = .systemFont(ofSize: 12, weight: .medium)
-        internetBadge.font = .systemFont(ofSize: 12, weight: .medium)
-        place(authBadge, in: overview, 250, 7, 90, 22)
-        place(internetBadge, in: overview, 342, 7, 90, 22)
         status.font = .systemFont(ofSize: 12); status.textColor = .secondaryLabelColor
         status.maximumNumberOfLines = 2; status.lineBreakMode = .byTruncatingTail
-        status.stringValue = "先在账号设置中填写凭据，再开始自动连接。"
+        status.stringValue = "请先设置账号，再开始自动连接。"
         place(status, in: overview, 88, 38, 528, 62)
         let statusSeparator = NSBox(); statusSeparator.boxType = .separator
         place(statusSeparator, in: overview, 0, 82, 616, 1)
-        for (index, title) in ["当前接口", "本地 IP", "校园网 IP", "上次检查", "检查周期"].enumerated() {
-            let x = CGFloat(index % 3) * 205, y = CGFloat(index / 3) * 48 + 94
+        for (index, title) in ["账号", "当前接口", "检查周期", "上次检查", "本地 IP", "校园网 IP"].enumerated() {
+            let x = CGFloat(index % 3) * 205, y = CGFloat(index / 3) * 52 + 94
             label(title, in: overview, x, y, 190, size: 11, secondary: true)
             let value = NSTextField(labelWithString: "—")
             value.font = .systemFont(ofSize: 14, weight: .medium); value.isSelectable = true
             value.lineBreakMode = .byTruncatingMiddle
             place(value, in: overview, x, y + 19, 190, 24); dashboardValues.append(value)
         }
-        dashboardValues[0].frame.size.width = 94
+        accountButton.bezelStyle = .rounded; accountButton.controlSize = .small
+        accountButton.target = self; accountButton.action = #selector(showAccountSettings)
+        place(accountButton, in: overview, 116, 109, 74, 25)
+        dashboardValues[0].frame.size.width = 108
+        interfaceButton.bezelStyle = .rounded; interfaceButton.controlSize = .small
+        interfaceButton.target = self; interfaceButton.action = #selector(showConnectionSettings)
+        place(interfaceButton, in: overview, 307, 109, 88, 25)
+        dashboardValues[1].frame.size.width = 96
         intervalSettings.bezelStyle = .rounded; intervalSettings.controlSize = .small
         intervalSettings.target = self; intervalSettings.action = #selector(showIntervalSettings)
         intervalSettings.setAccessibilityLabel("设置检查周期")
-        place(intervalSettings, in: overview, 266, 139, 60, 24)
+        place(intervalSettings, in: overview, 526, 109, 64, 25)
         updateState("idle")
-        let connectionSettings = NSButton(title: "连接设置…", target: self, action: #selector(showConnectionSettings))
-        connectionSettings.bezelStyle = .rounded; connectionSettings.controlSize = .small
-        place(connectionSettings, in: overview, 100, 110, 96, 26)
+        label("流量使用情况", in: overview, 0, 202, 190, size: 11, secondary: true)
+        trafficProgress.style = .bar
+        trafficProgress.isIndeterminate = false
+        trafficProgress.minValue = 0; trafficProgress.maxValue = 100; trafficProgress.doubleValue = 0
+        place(trafficProgress, in: overview, 0, 226, 390, 12)
+        trafficLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        place(trafficLabel, in: overview, 0, 242, 390, 22)
+        configureField(trafficTotal, "总流量（GB）", "例如 100")
+        trafficTotal.delegate = self
+        trafficSettings.bezelStyle = .rounded; trafficSettings.controlSize = .small
+        trafficSettings.target = self; trafficSettings.action = #selector(showTrafficSettings)
         portalAuth.state = .on; connectivityProbe.state = .on; browserFallback.state = .on
         browserFallback.title = "网页兜底"
         for (index, controls) in [(portalAuth, portalTest), (connectivityProbe, connectivityTest), (browserFallback, browserTest)].enumerated() {
-            let y = CGFloat(205 + index * 48)
+            let y = CGFloat(282 + index * 48)
             place(controls.0, in: overview, 0, y, 190, 26)
             let result = NSTextField(labelWithString: "尚未运行")
             result.font = .systemFont(ofSize: 12); result.textColor = .secondaryLabelColor
@@ -213,88 +259,87 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         connectivityProbe.target = self; connectivityProbe.action = #selector(connectivityToggleChanged)
         portalAuth.target = self; portalAuth.action = #selector(taskToggleChanged)
         browserFallback.target = self; browserFallback.action = #selector(taskToggleChanged)
-        label("最近活动", in: overview, 0, 390, 300, size: 13, weight: .semibold)
-        openLogs.bezelStyle = .rounded; openLogs.controlSize = .small
-        openLogs.target = self; openLogs.action = #selector(openLogFolder)
-        place(openLogs, in: overview, 470, 384, 148, 28)
-        historyScroll.hasVerticalScroller = true; historyScroll.borderType = .bezelBorder
-        history.isEditable = false; history.isSelectable = true; history.font = .systemFont(ofSize: 12)
-        history.textColor = .secondaryLabelColor; history.backgroundColor = .textBackgroundColor
-        history.textContainerInset = NSSize(width: 10, height: 8)
-        history.frame = NSRect(x: 0, y: 0, width: 616, height: 96)
-        history.isVerticallyResizable = true; history.autoresizingMask = [.width]
-        historyScroll.documentView = history
-        place(historyScroll, in: overview, 0, 420, 616, 142)
         start.bezelStyle = .rounded; start.controlSize = .large
         start.keyEquivalent = "\r"
         place(start, in: overview, 456, 2, 160, 34)
 
         settingsScroll.hasVerticalScroller = true; settingsScroll.drawsBackground = false
-        place(settingsScroll, in: settings, 0, 0, 616, 432)
-        settingsForm.frame = NSRect(x: 0, y: 0, width: 596, height: 582)
+        place(settingsScroll, in: settings, 0, 0, 616, 592)
+        settingsForm.frame = NSRect(x: 0, y: 0, width: 596, height: 580)
         settingsScroll.documentView = settingsForm
-        label("账号", in: settingsForm, 16, 0, 560, size: 18, weight: .semibold)
-        label("用于登录校园网，凭据可保存在系统钥匙串中。", in: settingsForm, 16, 30, 560, size: 12, secondary: true)
-        label("校园网账号", in: settingsForm, 16, 72, 560)
-        configureField(username, "校园网账号", "学号 / 工号")
-        place(username, in: settingsForm, 16, 98, 550, 30)
-        label("密码", in: settingsForm, 16, 150, 560)
-        configureField(password, "校园网密码", "请输入校园网密码")
-        place(password, in: settingsForm, 16, 176, 550, 30)
-        username.delegate = self; password.delegate = self
-        remember.title = "记住账号密码"; remember.toolTip = "使用系统钥匙串保存；取消勾选后删除保存的凭据。"
-        place(remember, in: settingsForm, 16, 224, 550, 24)
+        label("通用设置", in: settingsForm, 16, 0, 560, size: 18, weight: .semibold)
         launchAtLogin.target = self; launchAtLogin.action = #selector(startupChanged)
-        place(launchAtLogin, in: settingsForm, 16, 266, 300, 24)
+        place(launchAtLogin, in: settingsForm, 16, 46, 300, 24)
         launchHint.font = .systemFont(ofSize: 12); launchHint.textColor = .secondaryLabelColor
-        place(launchHint, in: settingsForm, 16, 300, 550, 34)
+        place(launchHint, in: settingsForm, 16, 78, 550, 34)
         loginSettings.bezelStyle = .rounded; loginSettings.controlSize = .small
         loginSettings.target = self; loginSettings.action = #selector(openLoginSettings)
-        place(loginSettings, in: settingsForm, 340, 262, 228, 30)
-        let formSeparator = NSBox(); formSeparator.boxType = .separator
-        place(formSeparator, in: settingsForm, 16, 344, 550, 1)
-        label("连接", in: settingsForm, 16, 366, 550, size: 18, weight: .semibold)
-        label("校园网接口", in: settingsForm, 16, 406, 550)
-        interfaces.addItem(withTitle: "自动选择"); interfaces.setAccessibilityLabel("校园网接口")
-        place(interfaces, in: settingsForm, 12, 432, 380, 32)
-        detect.bezelStyle = .rounded; place(detect, in: settingsForm, 408, 432, 160, 32)
-        configureField(interval, "检查周期（秒）", "10–86400"); interval.delegate = self
-        advancedButton.setButtonType(.pushOnPushOff); advancedButton.bezelStyle = .disclosure
-        advancedButton.target = self; advancedButton.action = #selector(toggleAdvanced)
-        advancedButton.setAccessibilityLabel("展开或收起高级选项")
-        place(advancedButton, in: settingsForm, 16, 556, 18, 18)
-        label("高级选项", in: settingsForm, 42, 554, 500)
-        place(advancedSection, in: settingsForm, 16, 592, 550, 310)
-        label("网关地址", in: advancedSection, 0, 0, 550)
-        configureField(gateway, "网关 IPv4 地址", "10.200.21.4"); gateway.delegate = self
-        place(gateway, in: advancedSection, 0, 26, 250, 28)
-        label("通常无需修改", in: advancedSection, 266, 31, 284, size: 12, secondary: true)
-        let wifiButton = NSButton(title: "Wi-Fi 自动连接…", target: self, action: #selector(showWiFiOptions))
-        wifiButton.bezelStyle = .rounded; wifiButton.image = NSImage(systemSymbolName: "wifi", accessibilityDescription: nil)
-        wifiButton.imagePosition = .imageLeading
-        place(wifiButton, in: advancedSection, -4, 86, 212, 32)
-        label("按网卡设置 BUAA-WiFi 自动连接", in: advancedSection, 0, 128, 550, size: 12, secondary: true)
-        browserFallback.state = .on
-        label("浏览器可执行文件（留空自动查找 Chrome / Edge / Chromium）", in: advancedSection, 0, 208, 550, size: 12)
+        place(loginSettings, in: settingsForm, 340, 42, 228, 30)
+        label("流量套餐", in: settingsForm, 16, 132, 550)
+        trafficSettingsSummary.font = .systemFont(ofSize: 12); trafficSettingsSummary.textColor = .secondaryLabelColor
+        place(trafficSettingsSummary, in: settingsForm, 16, 160, 350, 24)
+        place(trafficSettings, in: settingsForm, 418, 154, 148, 28)
+        label("后台浏览器", in: settingsForm, 16, 204, 550)
         configureField(browserPath, "后台浏览器可执行文件", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-        place(browserPath, in: advancedSection, 0, 236, 550, 30)
-        advancedSection.isHidden = true
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 600, height: 492), styleMask: [.titled], backing: .buffered, defer: false)
-        panel.title = "连接设置"; panel.isReleasedWhenClosed = false
-        let panelContent = FlippedContent(frame: NSRect(x: 0, y: 0, width: 600, height: 492)); panel.contentView = panelContent
-        label("校园网接口", in: panelContent, 24, 20, 540)
-        interfaces.removeFromSuperview(); place(interfaces, in: panelContent, 20, 46, 370, 32)
-        detect.removeFromSuperview(); place(detect, in: panelContent, 404, 46, 170, 32)
-        advancedButton.removeFromSuperview(); place(advancedButton, in: panelContent, 24, 96, 18, 18)
-        label("高级选项", in: panelContent, 50, 94, 500)
-        advancedSection.removeFromSuperview(); place(advancedSection, in: panelContent, 24, 130, 550, 310)
+        place(browserPath, in: settingsForm, 16, 230, 550, 30)
+        label("留空时自动查找 Chrome、Edge 或 Chromium。", in: settingsForm, 16, 266, 550, size: 12, secondary: true)
+        let formSeparator = NSBox(); formSeparator.boxType = .separator
+        place(formSeparator, in: settingsForm, 16, 302, 550, 1)
+        label("最近活动", in: settingsForm, 16, 324, 300, size: 18, weight: .semibold)
+        openLogs.bezelStyle = .rounded; openLogs.controlSize = .small
+        openLogs.target = self; openLogs.action = #selector(openLogFolder)
+        place(openLogs, in: settingsForm, 418, 320, 148, 28)
+        historyScroll.hasVerticalScroller = true; historyScroll.borderType = .bezelBorder
+        history.isEditable = false; history.isSelectable = true; history.font = .systemFont(ofSize: 12)
+        history.textColor = .secondaryLabelColor; history.backgroundColor = .textBackgroundColor
+        history.textContainerInset = NSSize(width: 10, height: 8)
+        history.frame = NSRect(x: 0, y: 0, width: 550, height: 174)
+        history.isVerticallyResizable = true; history.autoresizingMask = [.width]
+        historyScroll.documentView = history
+        place(historyScroll, in: settingsForm, 16, 358, 550, 188)
+
+        configureField(username, "校园网账号", "学号 / 工号")
+        configureField(password, "校园网密码", "请输入校园网密码")
+        username.delegate = self; password.delegate = self
+        remember.title = "记住账号密码"; remember.toolTip = "使用应用内轻量加密保存；取消勾选后删除保存的凭据。"
+        configureField(interval, "检查周期（秒）", "10–86400"); interval.delegate = self
+        configureField(gateway, "网关 IPv4 地址", "10.200.21.4"); gateway.delegate = self
+        browserFallback.state = .on
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 600, height: 500), styleMask: [.titled], backing: .buffered, defer: false)
+        panel.title = "接口设置"; panel.isReleasedWhenClosed = false
+        let panelContent = FlippedContent(frame: NSRect(x: 0, y: 0, width: 600, height: 500)); panel.contentView = panelContent
+        label("校园网接口（可多选）", in: panelContent, 24, 20, 360, size: 16, weight: .semibold)
+        detect.title = "检测校园网"; detect.bezelStyle = .rounded
+        place(detect, in: panelContent, 420, 16, 154, 32)
+        let interfaceScroll = NSScrollView(frame: NSRect(x: 24, y: 58, width: 550, height: 250))
+        interfaceScroll.hasVerticalScroller = true; interfaceScroll.borderType = .bezelBorder
+        interfaceList.frame = NSRect(x: 0, y: 0, width: 530, height: 236)
+        interfaceScroll.documentView = interfaceList; panelContent.addSubview(interfaceScroll)
+        label("未勾选任何接口时自动选择；每个接口可单独设置网关与 Wi-Fi。", in: panelContent, 24, 314, 550, size: 12, secondary: true)
+        label("默认网关地址", in: panelContent, 24, 350, 180, size: 13, weight: .semibold)
+        place(gateway, in: panelContent, 24, 378, 240, 28)
+        label("仅用于没有单独设置网关的接口", in: panelContent, 280, 382, 280, size: 12, secondary: true)
         let doneConnection = NSButton(title: "完成", target: self, action: #selector(closeConnectionSettings))
         doneConnection.bezelStyle = .rounded; doneConnection.keyEquivalent = "\r"
         place(doneConnection, in: panelContent, 474, 450, 100, 30)
         connectionPanel = panel
-        settingsForm.setFrameSize(NSSize(width: 596, height: 350))
-        settingsHint.font = .systemFont(ofSize: 12); settingsHint.textColor = .secondaryLabelColor
-        place(settingsHint, in: settings, 0, 454, 388, 38)
+        rebuildInterfaceRows()
+
+        let credentialsPanel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 500, height: 252), styleMask: [.titled], backing: .buffered, defer: false)
+        credentialsPanel.title = "账号设置"; credentialsPanel.isReleasedWhenClosed = false
+        let credentialsContent = FlippedContent(frame: NSRect(x: 0, y: 0, width: 500, height: 252)); credentialsPanel.contentView = credentialsContent
+        label("校园网账号", in: credentialsContent, 24, 20, 452)
+        place(username, in: credentialsContent, 24, 46, 452, 30)
+        label("密码", in: credentialsContent, 24, 92, 452)
+        place(password, in: credentialsContent, 24, 118, 452, 30)
+        place(remember, in: credentialsContent, 24, 164, 300, 24)
+        let cancelAccount = NSButton(title: "取消", target: self, action: #selector(closeAccountSettings))
+        cancelAccount.bezelStyle = .rounded; cancelAccount.keyEquivalent = "\u{1b}"
+        place(cancelAccount, in: credentialsContent, 278, 198, 90, 32)
+        let saveAccount = NSButton(title: "保存", target: self, action: #selector(saveAccountSettings))
+        saveAccount.bezelStyle = .rounded; saveAccount.keyEquivalent = "\r"
+        place(saveAccount, in: credentialsContent, 380, 198, 96, 32)
+        accountPanel = credentialsPanel
         start.target = self; start.action = #selector(dashboardAction)
         detect.target = self; detect.action = #selector(scan)
         remember.target = self; remember.action = #selector(rememberChanged)
@@ -321,12 +366,19 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
             connectivityProbe.state = (settings["connectivity_probe_enabled"] as? Bool ?? true) ? .on : .off
             connectivityToggleChanged()
             browserPath.stringValue = settings["browser_path"] as? String ?? ""
-            if let binding = settings["interface"] as? String {
-                interfaces.addItem(withTitle: "指定接口 · \(binding)"); selectionBindings.append(binding)
-                interfaces.selectItem(at: 1)
+            if let bindings = settings["interfaces"] as? [String] { selectedBindings = Set(bindings) }
+            else if let binding = settings["interface"] as? String { selectedBindings = [binding] }
+            interfaceGateways = settings["interface_gateways"] as? [String: String] ?? [:]
+            trafficTotal.stringValue = settings["traffic_total_gb"] as? String ?? ""
+        }
+        if let stored = UserDefaults.standard.dictionary(forKey: settingsKey + ".wifiNetworks") as? [String: [String]] {
+            wifiNetworks = stored.mapValues(Set.init)
+        } else {
+            for name in UserDefaults.standard.stringArray(forKey: settingsKey + ".wifi") ?? [] {
+                wifiNetworks[name] = ["BUAA-WiFi", "BUAA-WiFi-Free"]
             }
         }
-        wifiEnabled = Set(UserDefaults.standard.stringArray(forKey: settingsKey + ".wifi") ?? [])
+        updateTraffic(nil)
         wifi.report = { [weak self] message in self?.record(message) }
         reloadCredentials()
         subscribeNetwork()
@@ -338,13 +390,13 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
             self?.wifi.resume(); if let c = self?.client { buaa_resume(c) }
         })
         do { try LoginStartup.migrateLegacyIfNeeded() } catch { record("开机自启注册更新失败，请在设置中重新开启。") }
-        refreshStartup(); updateStartTitle(); renderHistory()
+        refreshStartup(); updateStartTitle(); renderHistory(); resizeWindow(for: 0, animated: false)
         if loginLaunch {
             if remember.state == .on && completeConfiguration && store != nil && source != nil {
                 NSApp.setActivationPolicy(.accessory); startMonitor()
                 if monitoring { hideWindow() } else { showWindow() }
             } else {
-                showWindow(); showPage(1); record("开机自启：请保存完整账号、密码和连接配置后启用自动连接。")
+                showWindow(); showAccountSettings(); record("开机自启：请先保存完整账号和密码。")
             }
         } else { showWindow(); scan() }
     }
@@ -369,44 +421,101 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         source = SCDynamicStoreCreateRunLoopSource(nil, store, 0)
         if let source = source { CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes) }
     }
-    @objc private func showWiFiOptions() {
-        if let panel = wifiPanel { panel.makeKeyAndOrderFront(nil); return }
-        let names = wifi.interfaceNames()
-        let height = CGFloat(min(460, max(1, names.count) * 38 + 166))
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 520, height: height),
-            styleMask: [.titled], backing: .buffered, defer: false)
-        panel.title = "Wi-Fi 自动连接"; panel.isReleasedWhenClosed = false
-        let content = FlippedContent(frame: NSRect(x: 0, y: 0, width: 520, height: height)); panel.contentView = content
-        let title = NSTextField(labelWithString: "自动连接 BUAA-WiFi")
-        title.font = .systemFont(ofSize: 16, weight: .semibold)
-        title.frame = NSRect(x: 24, y: 20, width: 472, height: 24); content.addSubview(title)
-        let label = NSTextField(wrappingLabelWithString: "开启后，在自动重连运行期间发现 BUAA-WiFi 时，会自动切换到该无线网络。")
-        label.font = .systemFont(ofSize: 12); label.textColor = .secondaryLabelColor
-        label.frame = NSRect(x: 24, y: 52, width: 472, height: 34); content.addSubview(label)
-        wifiRows = []
-        let list = FlippedContent(frame: NSRect(x: 0, y: 0, width: 464, height: CGFloat(max(1, names.count) * 38)))
-        if names.isEmpty {
-            let empty = NSTextField(labelWithString: "未发现 Wi-Fi 网卡")
-            empty.textColor = .secondaryLabelColor; empty.frame = NSRect(x: 0, y: 6, width: 460, height: 24); list.addSubview(empty)
+    private func rebuildInterfaceRows() {
+        interfaceList.subviews.forEach { $0.removeFromSuperview() }; interfaceRows = []
+        if interfaceRecords.isEmpty {
+            let empty = NSTextField(labelWithString: "尚未检测接口，请点击右上角“检测校园网”。")
+            empty.textColor = .secondaryLabelColor; empty.frame = NSRect(x: 14, y: 18, width: 480, height: 24)
+            interfaceList.addSubview(empty); interfaceList.setFrameSize(NSSize(width: 530, height: 236)); return
         }
-        for (index, name) in names.enumerated() {
-            let row = NSButton(checkboxWithTitle: "Wi-Fi（\(name)）", target: self, action: #selector(wifiOptionChanged(_:)))
-            row.identifier = NSUserInterfaceItemIdentifier(name); row.state = wifiEnabled.contains(name) ? .on : .off
-            row.frame = NSRect(x: 0, y: CGFloat(index*38), width: 460, height: 28)
-            list.addSubview(row); wifiRows.append(row)
+        let height = CGFloat(max(236, interfaceRecords.count * 48))
+        interfaceList.setFrameSize(NSSize(width: 530, height: height))
+        for (index, record) in interfaceRecords.enumerated() {
+            let binding = record["binding"] as? String ?? ""
+            let title = "\(record["label"] as? String ?? binding) · \(record["message"] as? String ?? "")"
+            let row = NSButton(checkboxWithTitle: title, target: self, action: #selector(interfaceSelectionChanged(_:)))
+            row.identifier = NSUserInterfaceItemIdentifier(binding); row.state = selectedBindings.contains(binding) ? .on : .off
+            row.frame = NSRect(x: 12, y: CGFloat(index * 48 + 8), width: 402, height: 28)
+            interfaceList.addSubview(row); interfaceRows.append(row)
+            let details = NSButton(title: "详情…", target: self, action: #selector(showInterfaceDetail(_:)))
+            details.bezelStyle = .rounded; details.controlSize = .small; details.tag = index
+            details.frame = NSRect(x: 430, y: CGFloat(index * 48 + 7), width: 78, height: 28)
+            interfaceList.addSubview(details)
         }
-        let scroll = NSScrollView(frame: NSRect(x: 24, y: 98, width: 472, height: height-154))
-        scroll.hasVerticalScroller = true; scroll.drawsBackground = false; scroll.documentView = list; content.addSubview(scroll)
-        let done = NSButton(title: "完成", target: self, action: #selector(closeWiFiOptions))
-        done.bezelStyle = .rounded; done.keyEquivalent = "\r"
-        done.frame = NSRect(x: 398, y: height-46, width: 100, height: 30); content.addSubview(done)
-        wifiPanel = panel; window.beginSheet(panel)
     }
-    @objc private func closeWiFiOptions() {
-        if let panel = wifiPanel { window.endSheet(panel); panel.orderOut(nil) }; wifiPanel = nil
+    @objc private func interfaceSelectionChanged(_ sender: NSButton) {
+        guard let binding = sender.identifier?.rawValue else { return }
+        if sender.state == .on { selectedBindings.insert(binding) } else { selectedBindings.remove(binding) }
+        saveConnectionPreferences()
     }
-    @objc private func showConnectionSettings() { if let panel = connectionPanel { window.beginSheet(panel) } }
-    @objc private func closeConnectionSettings() { if let panel = connectionPanel { window.endSheet(panel); panel.orderOut(nil) } }
+    @objc private func showConnectionSettings() {
+        guard let panel = connectionPanel, window.attachedSheet == nil else { return }
+        rebuildInterfaceRows(); window.beginSheet(panel)
+    }
+    @objc private func closeConnectionSettings() {
+        saveConnectionPreferences()
+        if let panel = connectionPanel { window.endSheet(panel); panel.orderOut(nil) }
+    }
+    @objc private func showInterfaceDetail(_ sender: NSButton) {
+        guard interfaceRecords.indices.contains(sender.tag), let parent = connectionPanel else { return }
+        let record = interfaceRecords[sender.tag]
+        let binding = record["binding"] as? String ?? ""
+        let name = record["name"] as? String ?? binding
+        detailBinding = binding; detailInterfaceName = name
+        detailGateway.stringValue = interfaceGateways[binding] ?? ""
+        let targets = wifiNetworks[name] ?? []
+        wifiDefault.state = targets.contains("BUAA-WiFi") ? .on : .off
+        wifiFree.state = targets.contains("BUAA-WiFi-Free") ? .on : .off
+        let custom = targets.first { $0 != "BUAA-WiFi" && $0 != "BUAA-WiFi-Free" } ?? ""
+        wifiCustomEnabled.state = custom.isEmpty ? .off : .on; wifiCustomName.stringValue = custom
+        let isWiFi = wifi.interfaceNames().contains(name)
+        let height: CGFloat = isWiFi ? 350 : 230
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 500, height: height), styleMask: [.titled], backing: .buffered, defer: false)
+        panel.title = "接口详情 · \(name)"; panel.isReleasedWhenClosed = false
+        let content = FlippedContent(frame: NSRect(x: 0, y: 0, width: 500, height: height)); panel.contentView = content
+        let gatewayTitle = NSTextField(labelWithString: "自定义网关（留空使用 10.200.21.4）")
+        gatewayTitle.frame = NSRect(x: 24, y: 22, width: 452, height: 22); content.addSubview(gatewayTitle)
+        detailGateway.placeholderString = "10.200.21.4"; detailGateway.frame = NSRect(x: 24, y: 50, width: 260, height: 28); content.addSubview(detailGateway)
+        if isWiFi {
+            let wifiTitle = NSTextField(labelWithString: "Wi-Fi 自动连接")
+            wifiTitle.font = .systemFont(ofSize: 14, weight: .semibold); wifiTitle.frame = NSRect(x: 24, y: 104, width: 300, height: 22); content.addSubview(wifiTitle)
+            for (button, y) in [(wifiDefault, 136), (wifiFree, 168), (wifiCustomEnabled, 200)] {
+                button.frame = NSRect(x: 24, y: CGFloat(y), width: 220, height: 24); content.addSubview(button)
+            }
+            wifiCustomName.placeholderString = "自定义 SSID"; wifiCustomName.frame = NSRect(x: 246, y: 198, width: 230, height: 28); content.addSubview(wifiCustomName)
+            let hint = NSTextField(wrappingLabelWithString: "仅在自动连接运行期间生效；校园网网页密码不会用于 Wi-Fi。")
+            hint.font = .systemFont(ofSize: 12); hint.textColor = .secondaryLabelColor
+            hint.frame = NSRect(x: 24, y: 242, width: 452, height: 34); content.addSubview(hint)
+        }
+        let cancel = NSButton(title: "取消", target: self, action: #selector(closeInterfaceDetail))
+        cancel.bezelStyle = .rounded; cancel.frame = NSRect(x: 286, y: height - 50, width: 88, height: 30); content.addSubview(cancel)
+        let save = NSButton(title: "保存", target: self, action: #selector(saveInterfaceDetail))
+        save.bezelStyle = .rounded; save.keyEquivalent = "\r"; save.frame = NSRect(x: 388, y: height - 50, width: 88, height: 30); content.addSubview(save)
+        interfaceDetailPanel = panel; parent.beginSheet(panel)
+    }
+    @objc private func closeInterfaceDetail() {
+        if let panel = interfaceDetailPanel, let parent = connectionPanel { parent.endSheet(panel); panel.orderOut(nil) }
+        interfaceDetailPanel = nil
+    }
+    @objc private func saveInterfaceDetail() {
+        guard let binding = detailBinding, let name = detailInterfaceName else { return }
+        let gatewayValue = detailGateway.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !gatewayValue.isEmpty {
+            var address = in_addr()
+            guard gatewayValue.withCString({ inet_pton(AF_INET, $0, &address) }) == 1 else { alert("网关必须是 IPv4 地址"); return }
+            interfaceGateways[binding] = gatewayValue
+        } else { interfaceGateways.removeValue(forKey: binding) }
+        if wifi.interfaceNames().contains(name) {
+            var targets = Set<String>()
+            if wifiDefault.state == .on { targets.insert("BUAA-WiFi") }
+            if wifiFree.state == .on { targets.insert("BUAA-WiFi-Free") }
+            let custom = wifiCustomName.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if wifiCustomEnabled.state == .on && !custom.isEmpty { targets.insert(custom) }
+            if targets.isEmpty { wifiNetworks.removeValue(forKey: name) } else { wifiNetworks[name] = targets }
+            persistWiFiNetworks(); wifi.configure(networks: wifiNetworks, active: monitoring)
+        }
+        saveConnectionPreferences(); closeInterfaceDetail()
+    }
     @objc private func showIntervalSettings() {
         guard intervalPanel == nil, window.attachedSheet == nil else { return }
         let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 420, height: 190), styleMask: [.titled], backing: .buffered, defer: false)
@@ -444,14 +553,76 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         updateStartTitle(); closeIntervalSettings()
         if !monitoring { record("检查周期已设置为 \(seconds) 秒") }
     }
+    @objc private func showTrafficSettings() {
+        guard trafficPanel == nil, window.attachedSheet == nil else { return }
+        trafficTotalBeforeEditing = trafficTotal.stringValue
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 420, height: 210), styleMask: [.titled], backing: .buffered, defer: false)
+        panel.title = "设置总流量"; panel.isReleasedWhenClosed = false
+        let content = FlippedContent(frame: NSRect(x: 0, y: 0, width: 420, height: 210)); panel.contentView = content
+        let hint = NSTextField(wrappingLabelWithString: "设置套餐总流量后，连接页会按门户返回的已用流量显示进度。留空可关闭进度比例。")
+        hint.font = .systemFont(ofSize: 13); hint.frame = NSRect(x: 24, y: 20, width: 372, height: 42); content.addSubview(hint)
+        trafficTotal.frame = NSRect(x: 24, y: 76, width: 180, height: 28); content.addSubview(trafficTotal)
+        let unit = NSTextField(labelWithString: "GB"); unit.frame = NSRect(x: 216, y: 80, width: 50, height: 22); content.addSubview(unit)
+        trafficError.stringValue = ""; trafficError.textColor = .systemRed; trafficError.font = .systemFont(ofSize: 12)
+        trafficError.frame = NSRect(x: 24, y: 112, width: 372, height: 22); content.addSubview(trafficError)
+        let cancel = NSButton(title: "取消", target: self, action: #selector(closeTrafficSettings))
+        cancel.bezelStyle = .rounded; cancel.keyEquivalent = "\u{1b}"; cancel.frame = NSRect(x: 208, y: 158, width: 88, height: 30); content.addSubview(cancel)
+        let save = NSButton(title: "保存", target: self, action: #selector(saveTrafficSettings))
+        save.bezelStyle = .rounded; save.keyEquivalent = "\r"; save.frame = NSRect(x: 306, y: 158, width: 88, height: 30); content.addSubview(save)
+        trafficPanel = panel; window.beginSheet(panel); panel.makeFirstResponder(trafficTotal); trafficTotal.selectText(nil)
+    }
+    @objc private func closeTrafficSettings() {
+        trafficTotal.stringValue = trafficTotalBeforeEditing
+        if let panel = trafficPanel { window.endSheet(panel); panel.orderOut(nil) }
+        trafficPanel = nil
+    }
+    @objc private func saveTrafficSettings() {
+        let value = trafficTotal.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !value.isEmpty && Double(value).map({ $0.isFinite && $0 > 0 }) != true {
+            trafficError.stringValue = "请输入大于 0 的数字，或留空关闭进度比例。"
+            trafficPanel?.makeFirstResponder(trafficTotal); trafficTotal.selectText(nil); return
+        }
+        trafficTotal.stringValue = value
+        trafficTotalBeforeEditing = value
+        saveConnectionPreferences(); updateTraffic(nil); closeTrafficSettings()
+        if !value.isEmpty { record("总流量已设置为 \(value) GB") }
+    }
+    @objc private func showAccountSettings() {
+        guard let panel = accountPanel, window.attachedSheet == nil else { return }
+        username.isEnabled = !monitoring; password.isEnabled = !monitoring; remember.isEnabled = !monitoring
+        window.beginSheet(panel); panel.makeFirstResponder(username)
+    }
+    @objc private func closeAccountSettings() {
+        if let panel = accountPanel { window.endSheet(panel); panel.orderOut(nil) }
+    }
+    @objc private func saveAccountSettings() {
+        guard !username.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !password.stringValue.isEmpty else { alert("请输入账号和密码"); return }
+        do {
+            if remember.state == .on { try saveCredentials(username.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), password.stringValue) }
+            else { try forgetCredentials() }
+            updateStartTitle(); closeAccountSettings(); record("账号设置已保存")
+        } catch { alert("无法保存应用内加密凭据") }
+    }
     @objc private func selectPage() {
         showPage(navigation.selectedSegment)
     }
     private func showPage(_ index: Int) {
         navigation.selectedSegment = index; pages.selectTabViewItem(at: index)
-        window.makeFirstResponder(index == 1 && username.isEnabled ? username : navigation)
+        window.makeFirstResponder(index == 1 && browserPath.isEnabled ? browserPath : navigation)
         start.keyEquivalent = index == 0 ? "\r" : ""
-        if index == 0 { renderHistory() }
+        if index == 1 { renderHistory() }
+        resizeWindow(for: index, animated: true)
+    }
+    private func resizeWindow(for page: Int, animated: Bool) {
+        let contentHeight: CGFloat = page == 0 ? 530 : 680
+        let current = window.frame
+        let targetContent = NSRect(x: 0, y: 0, width: 680, height: contentHeight)
+        var target = window.frameRect(forContentRect: targetContent)
+        target.origin.x = current.origin.x
+        target.origin.y = current.maxY - target.height
+        if animated { window.animator().setFrame(target, display: true) }
+        else { window.setFrame(target, display: true) }
     }
     private var completeConfiguration: Bool {
         var address = in_addr()
@@ -460,8 +631,8 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
             && gateway.stringValue.trimmingCharacters(in: .whitespaces).withCString({ inet_pton(AF_INET, $0, &address) }) == 1
     }
     private func saveConnectionPreferences() {
-        var settings: [String: Any] = ["interval": String(checkInterval), "gateway": gateway.stringValue.trimmingCharacters(in: .whitespaces), "browser_fallback": browserFallback.state == .on, "portal_auth_enabled": portalAuth.state == .on, "connectivity_probe_enabled": connectivityProbe.state == .on, "browser_path": browserPath.stringValue.trimmingCharacters(in: .whitespaces)]
-        if let binding = selectionBindings[interfaces.indexOfSelectedItem] { settings["interface"] = binding }
+        var settings: [String: Any] = ["interval": String(checkInterval), "gateway": gateway.stringValue.trimmingCharacters(in: .whitespaces), "browser_fallback": browserFallback.state == .on, "portal_auth_enabled": portalAuth.state == .on, "connectivity_probe_enabled": connectivityProbe.state == .on, "browser_path": browserPath.stringValue.trimmingCharacters(in: .whitespaces), "interfaces": Array(selectedBindings).sorted(), "interface_gateways": interfaceGateways, "traffic_total_gb": trafficTotal.stringValue.trimmingCharacters(in: .whitespaces)]
+        settings.removeValue(forKey: "interface")
         UserDefaults.standard.set(settings, forKey: settingsKey)
     }
     private func refreshStartup() {
@@ -487,36 +658,31 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
     }
     @objc private func dashboardAction() {
         if monitoring { stopMonitor(); return }
-        if (portalAuth.state == .on || browserFallback.state == .on) && (username.stringValue.trimmingCharacters(in: .whitespaces).isEmpty || password.stringValue.isEmpty) { focusSetting(username); return }
+        if (portalAuth.state == .on || browserFallback.state == .on) && (username.stringValue.trimmingCharacters(in: .whitespaces).isEmpty || password.stringValue.isEmpty) { showAccountSettings(); return }
         startMonitor()
     }
-    func controlTextDidChange(_ notification: Notification) { updateStartTitle() }
+    func controlTextDidChange(_ notification: Notification) {
+        updateStartTitle()
+        if let field = notification.object as? NSTextField, field === browserPath || field === gateway {
+            saveConnectionPreferences()
+        }
+    }
     func controlTextDidBeginEditing(_ notification: Notification) {
         if let field = notification.object as? NSTextField, field === username || field === password {
-            settingsForm.scrollToVisible(settingsForm.convert(field.bounds, from: field).insetBy(dx: 0, dy: -12))
+            accountPanel?.contentView?.scrollToVisible(field.frame)
         }
     }
     private func updateStartTitle() {
         let credentialsRequired = portalAuth.state == .on || browserFallback.state == .on
         let configured = !credentialsRequired || (!username.stringValue.trimmingCharacters(in: .whitespaces).isEmpty && !password.stringValue.isEmpty)
         start.title = monitoring ? "停止自动连接" : (configured ? "开始自动连接" : "设置账号")
-        dashboardValues[4].stringValue = "\(checkInterval) 秒"
-    }
-    @objc private func toggleAdvanced() {
-        let expanded = advancedButton.state == .on
-        if !expanded { window.makeFirstResponder(advancedButton) }
-        advancedSection.isHidden = !expanded
-        if connectionPanel == nil { settingsForm.setFrameSize(NSSize(width: 596, height: expanded ? 922 : 582)) }
+        dashboardValues[0].stringValue = username.stringValue.trimmingCharacters(in: .whitespaces).isEmpty ? "未设置" : username.stringValue.trimmingCharacters(in: .whitespaces)
+        dashboardValues[2].stringValue = "\(checkInterval) 秒"
     }
     private func focusSetting(_ field: NSTextField) {
         if field === interval { showIntervalSettings(); return }
-        if field === gateway || field === browserPath {
-            if field === gateway || field === browserPath { advancedButton.state = .on; toggleAdvanced() }
-            showConnectionSettings(); window.makeFirstResponder(field); field.selectText(nil); return
-        }
+        if field === username || field === password { showAccountSettings(); return }
         showPage(1)
-        if field === gateway { advancedButton.state = .on; toggleAdvanced() }
-        settingsForm.scrollToVisible(settingsForm.convert(field.bounds, from: field).insetBy(dx: 0, dy: -24))
         window.makeFirstResponder(field); field.selectText(nil)
     }
     private func renderHistory() {
@@ -537,16 +703,17 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
     private func applyDashboard(_ event: [String: Any]) {
         guard let snapshot = event["dashboard"] as? [String: Any] else { return }
         updateState(snapshot["phase"] as? String ?? "idle")
-        dashboardValues[0].stringValue = snapshot["interface"] as? String ?? "—"
-        dashboardValues[1].stringValue = snapshot["local_ip"] as? String ?? "—"
-        dashboardValues[2].stringValue = snapshot["campus_ip"] as? String ?? "—"
+        dashboardValues[0].stringValue = username.stringValue.trimmingCharacters(in: .whitespaces).isEmpty ? "未设置" : username.stringValue.trimmingCharacters(in: .whitespaces)
+        dashboardValues[1].stringValue = snapshot["interface"] as? String ?? "—"
+        dashboardValues[2].stringValue = "\(checkInterval) 秒"
         dashboardValues[3].stringValue = localTime(snapshot["last_check_at"])
-        dashboardValues[4].stringValue = "\(checkInterval) 秒"
+        dashboardValues[4].stringValue = snapshot["local_ip"] as? String ?? "—"
+        dashboardValues[5].stringValue = snapshot["campus_ip"] as? String ?? "—"
+        updateTraffic(snapshot["traffic_used_bytes"] as? UInt64)
         let auth = ["unknown": "未知", "offline": "未认证", "online": "已认证"][snapshot["authentication"] as? String ?? "unknown"] ?? "未知"
         let internet = ["unknown": "未知", "available": "可用", "unavailable": "不可用"][snapshot["connectivity"] as? String ?? "unknown"] ?? "未知"
         let authColor: NSColor = auth == "已认证" ? .systemGreen : (auth == "未认证" ? .systemOrange : .secondaryLabelColor)
         let internetColor: NSColor = internet == "可用" ? .systemGreen : (internet == "不可用" ? .systemRed : .secondaryLabelColor)
-        setBadge(authBadge, auth, authColor); setBadge(internetBadge, internet, internetColor)
         let message = event["message"] as? String ?? ""
         status.stringValue = message; trayStatus.title = message; item.button?.toolTip = message
         if snapshot["phase"] as? String != "stopped", let tasks = snapshot["tasks"] as? [String: Any] {
@@ -559,6 +726,24 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
                 else if index == 1 { setBadge(taskResults[index], internet, internetColor) }
                 else { taskResults[index].stringValue = reason == "waiting_trigger" ? "—" : (task["message"] as? String ?? "—") }
             }
+        }
+    }
+    private func updateTraffic(_ used: UInt64?) {
+        if let used = used { trafficUsedBytes = used }
+        let used = used ?? trafficUsedBytes
+        trafficProgress.isIndeterminate = false
+        let configuredTotal = trafficTotal.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        trafficSettingsSummary.stringValue = configuredTotal.isEmpty ? "未设置总流量" : "当前总流量：\(configuredTotal) GB"
+        let formatter = ByteCountFormatter(); formatter.countStyle = .binary
+        let totalGB = Double(trafficTotal.stringValue.trimmingCharacters(in: .whitespaces))
+        let totalBytes = totalGB.flatMap { $0 > 0 ? $0 * 1_000_000_000 : nil }
+        if let used = used {
+            trafficLabel.stringValue = totalBytes.map { _ in "已用 \(formatter.string(fromByteCount: Int64(clamping: used))) / \(trafficTotal.stringValue) GB" }
+                ?? "已用 \(formatter.string(fromByteCount: Int64(clamping: used))) · 设置总流量后显示进度"
+            trafficProgress.doubleValue = totalBytes.map { min(100, Double(used) / $0 * 100) } ?? 0
+        } else {
+            trafficLabel.stringValue = "尚未获取流量"
+            trafficProgress.doubleValue = 0
         }
     }
     private func updateState(_ state: String) {
@@ -584,20 +769,17 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         stateIcon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
         stateIcon.contentTintColor = color
     }
-    @objc private func wifiOptionChanged(_ sender: NSButton) {
-        guard let name = sender.identifier?.rawValue else { return }
-        if sender.state == .on { wifiEnabled.insert(name) } else { wifiEnabled.remove(name) }
-        UserDefaults.standard.set(Array(wifiEnabled).sorted(), forKey: settingsKey + ".wifi")
-        wifi.configure(enabled: wifiEnabled, active: monitoring)
+    private func persistWiFiNetworks() {
+        UserDefaults.standard.set(wifiNetworks.mapValues { Array($0).sorted() }, forKey: settingsKey + ".wifiNetworks")
     }
     private func alert(_ message: String) { let a = NSAlert(); a.messageText = "北航校园网"; a.informativeText = message; a.runModal() }
     private func reloadCredentials() {
         do { if let credentials = try loadCredentials() { username.stringValue = credentials.0; password.stringValue = credentials.1; remember.state = .on } }
-        catch { record("原生版凭据读取失败，请重新输入") }
+        catch { record("应用内凭据读取失败，请重新输入") }
         updateStartTitle()
     }
     @objc private func rememberChanged() {
-        if remember.state == .off { do { try forgetCredentials() } catch { remember.state = .on; alert("无法删除钥匙串凭据") } }
+        if remember.state == .off { do { try forgetCredentials() } catch { remember.state = .on; alert("无法删除应用内凭据") } }
     }
     private func createClient(_ scan: Bool, requireCredentials: Bool = true) -> Bool {
         guard client == nil else { return false }
@@ -607,13 +789,12 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         guard gateway.stringValue.trimmingCharacters(in: .whitespaces).withCString({ inet_pton(AF_INET, $0, &address) }) == 1 else {
             focusSetting(gateway); alert("网关必须是 IPv4 地址"); return false
         }
-        let binding = selectionBindings[interfaces.indexOfSelectedItem]
         var config: [String: Any] = ["username": scan ? "" : username.stringValue.trimmingCharacters(in: .whitespaces), "password": scan ? "" : password.stringValue,
             "gateway_ip": gateway.stringValue.trimmingCharacters(in: .whitespaces), "interval": seconds, "external_timer": true,
             "portal_auth_enabled": portalAuth.state == .on, "connectivity_probe_enabled": connectivityProbe.state == .on,
             "browser_fallback": browserFallback.state == .on]
         if !browserPath.stringValue.trimmingCharacters(in: .whitespaces).isEmpty { config["browser_path"] = browserPath.stringValue.trimmingCharacters(in: .whitespaces) }
-        if let binding = binding, !scan { config["interface"] = binding }
+        if !scan { config["interfaces"] = Array(selectedBindings).sorted(); config["interface_gateways"] = interfaceGateways }
         guard let data = try? JSONSerialization.data(withJSONObject: config), let json = String(data: data, encoding: .utf8) else { return false }
         epoch &+= 1; callbackBox = CallbackContext(self, epoch)
         client = json.withCString { buaa_create($0, coreCallback, Unmanaged.passUnretained(callbackBox!).toOpaque()) }
@@ -624,8 +805,7 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         [username, password, gateway, browserPath].forEach { $0.isEnabled = !busy }
         portalAuth.isEnabled = !busy; connectivityProbe.isEnabled = !busy
         browserFallback.isEnabled = !busy && connectivityProbe.state == .on
-        interfaces.isEnabled = !busy; remember.isEnabled = !busy; start.isEnabled = !scanning && testing == nil; detect.isEnabled = !busy
-        settingsHint.stringValue = busy ? "修改账号或连接配置，请先到仪表盘停止。" : "开始时保存并应用设置。"
+        interfaceButton.isEnabled = !busy; accountButton.isEnabled = !busy; remember.isEnabled = !busy; start.isEnabled = !scanning && testing == nil; detect.isEnabled = !busy
         updateStartTitle()
     }
     @objc private func connectivityToggleChanged() {
@@ -666,14 +846,14 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         do {
             if remember.state == .on && credentialsRequired { try saveCredentials(username.stringValue.trimmingCharacters(in: .whitespaces), password.stringValue) }
             else { try forgetCredentials() }
-        } catch { releaseClient(); alert("无法更新钥匙串凭据"); return }
+        } catch { releaseClient(); alert("无法保存应用内加密凭据"); return }
         saveConnectionPreferences()
         scanning = false; setBusy(true)
         if buaa_start(client) != 0 { releaseClient(); setBusy(false); alert("无法启动监控"); return }
-        monitoring = true; wifi.configure(enabled: wifiEnabled, active: true)
+        monitoring = true; wifi.configure(networks: wifiNetworks, active: true)
         password.stringValue = ""; showPage(0); updateStartTitle(); updateState("checking"); record("正在检查校园网…")
     }
-    @objc private func stopMonitor() { wifi.configure(enabled: wifiEnabled, active: false); cancelTimer(); start.isEnabled = false; start.title = "正在停止…"; if let c = client { buaa_stop(c); record("正在停止…") } }
+    @objc private func stopMonitor() { wifi.configure(networks: wifiNetworks, active: false); cancelTimer(); start.isEnabled = false; start.title = "正在停止…"; if let c = client { buaa_stop(c); record("正在停止…") } }
     private func cancelTimer() { timer?.cancel(); timer = nil }
     private func releaseClient() {
         cancelTimer(); if let c = client { buaa_free(c) }; client = nil; callbackBox = nil; epoch &+= 1
@@ -693,21 +873,11 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         }
         if !monitoring && (state != "stopped" || !scanning) { updateState(state) }
         if state == "interfaces", let records = event["records"] as? [[String: Any]] {
-            let old = selectionBindings[interfaces.indexOfSelectedItem]
-            interfaces.removeAllItems(); interfaces.addItem(withTitle: "自动选择"); selectionBindings = [nil]
-            for row in records {
-                let label = row["label"] as? String ?? ""; let message = row["message"] as? String ?? ""
-                interfaces.addItem(withTitle: "\(label) · \(message)"); selectionBindings.append(row["binding"] as? String)
-            }
-            if let index = selectionBindings.firstIndex(where: { $0 == old }) { interfaces.selectItem(at: index) }
-            else if let old = old {
-                interfaces.addItem(withTitle: "指定接口 · \(old)（暂不可用）"); selectionBindings.append(old)
-                interfaces.selectItem(at: selectionBindings.count - 1)
-            }
+            interfaceRecords = records; rebuildInterfaceRows()
         }
         if state == "stopped" {
             let wasScanning = scanning; scanning = false
-            monitoring = false; wifi.configure(enabled: wifiEnabled, active: false)
+            monitoring = false; wifi.configure(networks: wifiNetworks, active: false)
             testing = nil; releaseClient(); setBusy(false); reloadCredentials()
             [portalTest, connectivityTest, browserTest].forEach { $0.isEnabled = true }
             taskNext[0].stringValue = portalAuth.state == .on ? "启动后立即" : "已关闭"
@@ -734,7 +904,7 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         let line = "\(formatter.string(from: Date()))  \(message)"
         lines.append(line); if lines.count > 120 { lines.removeFirst(lines.count-120) }
         appendLog(line)
-        if navigation.selectedSegment == 0 { renderHistory() }
+        if navigation.selectedSegment == 1 { renderHistory() }
     }
     private func prepareLogFolder() {
         do {
