@@ -291,7 +291,7 @@ impl App {
             let y = self.px(296) - self.settings_scroll;
             appearance::line(dc, self.px(20), y, self.px(564), y, p.border);
         } else if self.active_page == 0 {
-            for (y, height) in [(80, 98), (188, 118), (318, 126)] {
+            for (y, height) in [(80, 98), (190, 144), (346, 124)] {
                 appearance::rounded(
                     dc,
                     &self.rect(32, y, 616, height, self.scroll),
@@ -322,7 +322,7 @@ impl App {
         let card = GetParent(control) == self.settings_pane
             || control == self.history
             || edit
-            || (self.active_page == 0 && y >= self.px(80) && y < self.px(354));
+            || (self.active_page == 0 && y >= self.px(80) && y < self.px(470));
         let color = if card { p.surface } else { p.background };
         SetBkColor(dc, color);
         SetBkMode(dc, TRANSPARENT as i32);
@@ -657,8 +657,8 @@ impl App {
         .iter()
         .enumerate()
         {
-            let x = 32 + (index as i32 % 3) * 205;
-            let y = 174 + (index as i32 / 3) * 46;
+            let x = 48 + (index as i32 % 3) * 202;
+            let y = 200 + (index as i32 / 3) * 50;
             self.label(title, x, y, 180);
             self.dashboard_values[index] =
                 self.control("STATIC", "—", SS_ENDELLIPSIS, x, y + 20, 180, 24, 0);
@@ -685,33 +685,33 @@ impl App {
             "BUTTON",
             "设置…",
             WS_TABSTOP,
-            137,
-            193,
-            70,
-            27,
+            144,
+            218,
+            82,
+            29,
             ACCOUNT_SETTINGS,
         );
         self.control(
             "BUTTON",
             "接口设置…",
             WS_TABSTOP,
-            328,
-            193,
-            106,
-            27,
+            342,
+            218,
+            94,
+            29,
             CONNECTION_SETTINGS,
         );
 
-        self.label("流量使用情况", 48, 272, 160);
+        self.label("流量使用情况", 48, 300, 160);
         self.traffic_progress =
-            self.control("msctls_progress32", "", PBS_SMOOTH, 48, 294, 584, 12, 0);
+            self.control("msctls_progress32", "", PBS_SMOOTH, 48, 320, 584, 10, 0);
         SendMessageW(self.traffic_progress, PBM_SETRANGE32, 0, 1000);
         self.traffic_label = self.control(
             "STATIC",
             "尚未获取流量",
             SS_ENDELLIPSIS,
             208,
-            272,
+            300,
             424,
             24,
             0,
@@ -720,8 +720,8 @@ impl App {
             "BUTTON",
             "校园网认证（普通连接）",
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            32,
-            334,
+            48,
+            362,
             190,
             25,
             PORTAL_AUTH,
@@ -730,8 +730,8 @@ impl App {
             "BUTTON",
             "外网可用性检测",
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            32,
-            370,
+            48,
+            398,
             190,
             25,
             CONNECTIVITY_PROBE,
@@ -740,8 +740,8 @@ impl App {
             "BUTTON",
             "网页兜底",
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            32,
-            406,
+            48,
+            434,
             190,
             25,
             BROWSER_FALLBACK,
@@ -753,14 +753,14 @@ impl App {
         ] {
             SendMessageW(control, BM_SETCHECK, BST_CHECKED as usize, 0);
         }
-        for (index, y) in [334, 370, 406].iter().enumerate() {
+        for (index, y) in [362, 398, 434].iter().enumerate() {
             self.task_results[index] =
-                self.control("STATIC", "尚未运行", SS_ENDELLIPSIS, 228, *y, 170, 24, 0);
+                self.control("STATIC", "尚未运行", SS_ENDELLIPSIS, 250, *y, 156, 24, 0);
             self.task_next[index] = self.control(
                 "STATIC",
                 if index == 2 { "—" } else { "启动后立即" },
                 SS_ENDELLIPSIS,
-                402,
+                414,
                 *y,
                 130,
                 24,
@@ -782,7 +782,7 @@ impl App {
             "设置账号",
             BS_DEFPUSHBUTTON as u32 | WS_TABSTOP,
             462,
-            462,
+            486,
             186,
             38,
             START,
@@ -1879,32 +1879,32 @@ impl App {
             );
             return;
         }
-        let dialog = self.modal_window(self.window, "账号设置", 500, 280);
+        let dialog = self.modal_window(self.window, "账号设置", 460, 250);
         if dialog.is_null() {
             return;
         }
-        self.modal_control(dialog, "STATIC", "校园网账号", 0, 24, 22, 440, 22, 0);
+        self.modal_control(dialog, "STATIC", "校园网账号", 0, 22, 18, 416, 22, 0);
         let username = self.modal_control(
             dialog,
             "EDIT",
             &text(self.username),
             ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-            24,
-            48,
-            440,
-            30,
+            22,
+            42,
+            416,
+            28,
             9001,
         );
-        self.modal_control(dialog, "STATIC", "校园网密码", 0, 24, 88, 440, 22, 0);
+        self.modal_control(dialog, "STATIC", "校园网密码", 0, 22, 78, 416, 22, 0);
         let password = self.modal_control(
             dialog,
             "EDIT",
             &text(self.password),
             ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-            24,
-            114,
-            440,
-            30,
+            22,
+            102,
+            416,
+            28,
             9002,
         );
         let remember = self.modal_control(
@@ -1912,8 +1912,8 @@ impl App {
             "BUTTON",
             "记住账号密码（应用内轻量加密）",
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            24,
-            158,
+            22,
+            142,
             330,
             24,
             9003,
@@ -1924,16 +1924,16 @@ impl App {
             SendMessageW(self.remember, BM_GETCHECK, 0, 0) as usize,
             0,
         );
-        self.modal_control(dialog, "BUTTON", "取消", WS_TABSTOP, 270, 206, 90, 32, 2);
+        self.modal_control(dialog, "BUTTON", "取消", WS_TABSTOP, 246, 176, 88, 30, 2);
         self.modal_control(
             dialog,
             "BUTTON",
             "保存",
             BS_DEFPUSHBUTTON as u32 | WS_TABSTOP,
-            372,
-            206,
+            346,
+            176,
             92,
-            32,
+            30,
             1,
         );
         EnableWindow(self.window, 0);

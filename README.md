@@ -1,6 +1,6 @@
 # 北航校园网原生自动登录
 
-共享 Rust 认证内核，Windows Win32 与 macOS AppKit 原生界面，Linux Docker 运行编译后的命令行程序。发行版不包含 Python，运行时不启动 curl、PowerShell、ifconfig 或 ip 子进程。
+共享 Rust 认证内核，Windows Win32 与 macOS AppKit 原生界面，Linux Docker 提供内嵌网页管理端。发行版不包含 Python 或 Node.js，运行时不启动 curl、PowerShell、ifconfig 或 ip 子进程。
 
 ## 各平台使用
 
@@ -18,21 +18,36 @@
 
 macOS 13+ 使用 [SMAppService 系统登录项](https://developer.apple.com/documentation/servicemanagement/smappservice/mainapp)，需要系统允许时可点击“打开系统登录项设置”；macOS 12 使用当前用户 LaunchAgent。Windows 使用 [当前用户 Run 登录启动项](https://learn.microsoft.com/en-us/windows/win32/setupapi/run-and-runonce-registry-keys)，无需管理员权限。关闭自启只取消之后的登录启动，不停止当前重连。请先将应用放在固定位置再开启：macOS 建议“应用程序”文件夹，Windows 移动 EXE 后重新开关一次自启更新路径。
 
-### Docker（原生预览）
+### Docker 网页版
 
 将 `owner/repo` 替换为仓库名：
 
 ```sh
 docker run -d --name buaalogin --restart unless-stopped --network host \
-  -e USERNAME='你的账号' -e PASSWORD='你的密码' \
+  -v buaalogin-data:/data \
+  ghcr.io/owner/repo:native-preview
+
+docker logs buaalogin
+```
+
+镜像支持 Linux amd64/arm64，默认监听 `0.0.0.0:8080`。首次启动后，从 `docker logs buaalogin` 复制一次性设置码，打开 `http://服务器地址:8080` 创建网页管理密码。镜像以 UID/GID 65532 非 root 用户运行，配置、凭据和最近 30 天日志存放在 `/data`；务必挂载数据卷，否则重建容器后会重新进入首次设置。
+
+仓库的 [`compose.yaml`](compose.yaml) 是 host-network 示例。使用原生 Linux host 网络时，服务才能直接看到宿主机校园网接口；macOS/Windows Docker Desktop 的虚拟网络不等价于宿主机接口。接口留空表示自动选择，显式多选后每个接口独立维护认证会话并使用自己的可选网关。容器会标注 Wi‑Fi/有线类型，但不能扫描、切换或连接宿主机 Wi‑Fi。
+
+网页提供“连接”和“设置”两页：账号、检查周期、流量进度、接口多选与逐接口网关、校园网认证/外网检测及测试、活动记录、日志下载和管理密码修改。运行中会锁定账号、接口和任务开关，但仍可修改检查周期与总流量。服务使用 SSE 推送状态，不需要定时刷新页面；镜像不包含旧 CLI、Chromium、开机自启、后台浏览器或网页兜底。Debian Bookworm 的 [Chromium 软件包](https://packages.debian.org/bookworm/amd64/chromium) 本体已超过约定的 50MB 增量，因此不加入镜像。
+
+服务只提供 HTTP，并默认允许局域网访问。**请仅在可信局域网中使用。** 公网部署必须自行配置 HTTPS 反向代理、来源限制和防火墙；设置码、管理密码和校园网密码都不应经不可信网络明文传输。修改监听地址/端口可设置 `WEB_BIND=0.0.0.0:18080`，并相应开放该端口；内置健康检查会自动使用同一地址。
+
+从旧 Docker 配置迁移时，可在一个全新的 `/data` 卷首次启动时继续传入：
+
+```sh
+docker run -d --name buaalogin --restart unless-stopped --network host \
+  -v buaalogin-data:/data \
+  -e USERNAME='你的账号' -e PASSWORD='你的密码' -e INTERFACE='eth0' \
   ghcr.io/owner/repo:native-preview
 ```
 
-镜像支持 Linux amd64/arm64。使用原生 Linux host 网络；macOS/Windows Docker Desktop 的虚拟网络不等价于宿主机校园网接口。
-
-必须通过环境变量传入非空 `USERNAME` 和 `PASSWORD`，即使使用 `--status` 也不能省略；不提供交互输入。默认尝试全部符合条件的 IPv4 接口，为每个接口独立维护认证会话，并使用统一配置的检查周期。指定接口可传 `-e INTERFACE=eth0` 或 `--interface eth0`。
-
-保留命令行选项：`--status`、`--once`、`--interface`、`--gateway-ip`、`--interval`（10–86400 秒整数）、`--debug`、`--log-file`。`--debug` 输出脱敏状态事件，不输出原始请求、凭据或 token。容器默认以非 root 用户运行，日志文件需使用可写挂载路径。停止容器通过 SIGTERM 取消监控；可用 `docker logs -f buaalogin` 查看状态变化。
+完整账号会被加密导入并自动开始监控。导入只在 `/data/settings.json` 不存在时执行；之后网页保存的配置始终优先，环境变量不会覆盖它。显式点击“开始”会持久化期望运行状态，正常重启和 SIGTERM 后自动恢复；显式停止则清除。可用 `docker logs -f buaalogin` 查看设置码和进程级状态，详细脱敏日志从设置页下载。
 
 ## 编译与发行
 
@@ -45,14 +60,14 @@ Rust 工具链由 `rust-toolchain.toml` 固定，依赖由 `Cargo.lock` 固定�
 # 在 Windows x64 上，需 Visual Studio C++ Build Tools
 powershell -NoProfile -File tools/build-windows.ps1
 
-# 在 Linux 上，需 libcurl 开发包与 pkg-config
-cargo build --locked --release -p buaalogin
+# Linux 网页服务，需 libcurl 开发包与 pkg-config
+cargo build --locked --release -p buaalogin-web
 
-# 原生 Docker 镜像
+# 网页版 Docker 镜像
 docker build -t buaalogin:local .
 ```
 
-桌面产物位于 `releases/`，macOS 解包构建目录为 `build/macos-native/BUAALogin.app`。Windows 静态链接 libcurl 与 CRT，使用 Schannel；macOS 链接系统 libcurl；Docker 链接发行版 libcurl/TLS 与 CA 证书。
+桌面产物位于 `releases/`，macOS 解包构建目录为 `build/macos-native/BUAALogin.app`。Windows 静态链接 libcurl 与 CRT，使用 Schannel；macOS 链接系统 libcurl；Docker 的单一网页服务二进制链接发行版 libcurl/TLS 与 CA 证书。
 
 push 自动构建两个桌面包和双架构镜像，不执行测试、格式或 lint 门禁；构建成功后发布 GitHub **预览 Release** 和 GHCR `native-preview`、`sha-<提交SHA>`，不自动覆盖已有 `latest`。完成 [实机与能耗验收](docs/acceptance.md) 后，可手动运行工作流并勾选 `promote_native`，发布正式 Release 和 `latest`。
 

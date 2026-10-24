@@ -1,6 +1,6 @@
 # 原生实现
 
-Cargo workspace 的 `buaa-core` 提供认证、HTTP、接口发现、调度和 C ABI；`buaalogin` 提供非交互 CLI；`buaalogin-windows` 是直接调用 Win32 的窗口／托盘程序。macOS 的 Swift/AppKit 入口静态链接 core。桌面构建通过 `browser-fallback` feature 按需启动本机 Chromium 系浏览器；CLI/Docker 关闭该能力。
+Cargo workspace 的 `buaa-core` 提供认证、HTTP、接口发现、调度和 C ABI；`buaalogin` 提供非交互 CLI；`buaalogin-web` 是 Docker 使用的网页服务；`buaalogin-windows` 是直接调用 Win32 的窗口／托盘程序。macOS 的 Swift/AppKit 入口静态链接 core。桌面构建通过 `browser-fallback` feature 按需启动本机 Chromium 系浏览器；CLI 和 Docker 网页服务关闭该能力，Docker 镜像只复制 `buaalogin-web`。
 
 ## 会话与网络
 
@@ -49,6 +49,14 @@ Windows 输入框仍由原生 Edit 负责输入法、密码遮蔽和辅助技术
 `dashboard` 是只读事件，其快照除原有连接字段外包含 `tasks.portal_auth`、`tasks.connectivity` 和 `tasks.browser_fallback`。每项任务提供 enabled、phase、message、last_run_at、next_run_at 与 schedule_reason；未知时间为 null。C ABI v1 通过新增的 `buaa_test(client, kind)` 兼容扩展支持认证、外网和网页三类真实测试。
 
 界面不使用网页视图、重绘定时器或循环动画；数据事件到来才更新。仪表盘隐藏时仅维护活动历史，返回后再渲染日志。
+
+## Docker 网页服务
+
+`buaalogin-web` 用 Axum 提供内嵌 HTML/CSS/JavaScript，不需要 Node.js 或外部静态文件。HTTP 线程只读取共享的脱敏快照并向 supervisor 发送命令；独立 supervisor 线程唯一持有 core `Handle`，串行执行开始、停止、接口检测、任务测试、周期修改和 core 事件。广播通道将完整状态快照送入 SSE；客户端断线由 EventSource 重连，接收端落后时改发 refresh 事件以重新读取 `/api/state`。
+
+首次运行生成高熵一次性设置码并仅写入进程日志。管理密码以 Argon2id 哈希保存在 `/data/web-auth.json`，随机会话只驻留内存、固定 24 小时失效；session cookie 为 HttpOnly/SameSite=Strict，写接口同时验证 Origin 和 CSRF。连续五次失败后锁定登录五分钟。校园网凭据沿用桌面端 `BUAACRED2` 轻量加密和完整性格式，但单独存放在 `/data/credentials.dat`；设置与认证文件通过同目录临时文件、fsync、原子替换和 0600 权限保存。
+
+`/data/settings.json` 中的 `monitor_enabled` 表示期望运行状态。显式开始/停止修改它；SIGTERM 和正常重启不清除，意外的 core 停止也保留并在 30 秒后重启。只有数据目录中没有 settings 时才读取旧 `USERNAME`、`PASSWORD`、`INTERFACE` 环境变量，完整账号会自动开始；之后环境变量不再覆盖网页设置。空接口集合表示自动选择，显式多选通过 core 的逐接口 Slot 独立监控。Linux 读取 `/sys/class/net/<name>/wireless` 只做 Wi‑Fi/有线标注，不尝试控制宿主机无线网络。
 
 ## 登录自启
 

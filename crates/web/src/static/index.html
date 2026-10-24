@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>北航校园网</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <main class="auth-shell" id="auth-view" hidden>
+    <section class="auth-card">
+      <div class="logo" aria-hidden="true">BU</div>
+      <h1 id="auth-title">北航校园网</h1>
+      <p class="muted" id="auth-hint"></p>
+      <form id="auth-form">
+        <label class="field" id="setup-code-field" hidden>
+          <span>一次性设置码</span>
+          <input id="setup-code" autocomplete="one-time-code" spellcheck="false">
+        </label>
+        <label class="field">
+          <span id="auth-password-label">管理密码</span>
+          <input id="auth-password" type="password" autocomplete="current-password" required minlength="8">
+        </label>
+        <button class="primary wide" type="submit" id="auth-submit">登录</button>
+        <p class="form-error" id="auth-error" role="alert"></p>
+      </form>
+      <p class="security-note">仅提供 HTTP，请只在可信局域网中使用。公网部署请配置 HTTPS 反向代理。</p>
+    </section>
+  </main>
+
+  <div class="app-shell" id="app-view" hidden>
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">BU</span><span>北航校园网</span></div>
+      <nav class="tabs" aria-label="页面">
+        <button class="tab active" data-page="connect">连接</button>
+        <button class="tab" data-page="settings">设置</button>
+      </nav>
+      <button class="icon-button" id="theme-button" title="切换深色模式" aria-label="切换深色模式">◐</button>
+    </header>
+
+    <main class="content">
+      <section class="page active" id="page-connect">
+        <article class="hero card">
+          <div class="state-icon" id="state-icon">○</div>
+          <div class="hero-copy">
+            <h1 id="state-title">尚未开始</h1>
+            <p id="state-message">正在读取状态…</p>
+          </div>
+          <button class="primary start-button" id="start-button">开始自动连接</button>
+        </article>
+
+        <article class="card overview-card">
+          <div class="metrics">
+            <div class="metric"><span>账号</span><div><strong id="metric-account">—</strong><button class="inline-button" id="account-button">设置</button></div></div>
+            <div class="metric"><span>当前接口</span><div><strong id="metric-interface">—</strong><button class="inline-button" id="interfaces-button">接口设置</button></div></div>
+            <div class="metric"><span>检查周期</span><div><strong id="metric-interval">—</strong><button class="inline-button" id="interval-button">设置</button></div></div>
+            <div class="metric"><span>上次检查</span><strong id="metric-last-check">—</strong></div>
+            <div class="metric"><span>本地 IP</span><strong id="metric-local-ip">—</strong></div>
+            <div class="metric"><span>校园网 IP</span><strong id="metric-campus-ip">—</strong></div>
+          </div>
+          <div class="traffic">
+            <div class="traffic-heading"><span>流量使用情况</span><span id="traffic-percent">—</span></div>
+            <div class="progress" role="progressbar" aria-label="流量使用比例"><i id="traffic-bar"></i></div>
+            <p id="traffic-label">尚未获取流量</p>
+          </div>
+        </article>
+
+        <article class="card tasks-card">
+          <div class="section-title"><div><h2>自动任务</h2><p>两个任务共用检查周期，并在 supervisor 中串行执行。</p></div></div>
+          <div class="task-row">
+            <label class="switch-label"><input type="checkbox" id="portal-enabled"><i></i><span>校园网认证</span></label>
+            <span class="task-status" id="portal-status">尚未运行</span>
+            <span class="task-next" id="portal-next">—</span>
+            <button class="secondary test-button" data-test="portal">测试</button>
+          </div>
+          <div class="task-row">
+            <label class="switch-label"><input type="checkbox" id="connectivity-enabled"><i></i><span>外网检测</span></label>
+            <span class="task-status" id="connectivity-status">尚未运行</span>
+            <span class="task-next" id="connectivity-next">—</span>
+            <button class="secondary test-button" data-test="connectivity">测试</button>
+          </div>
+        </article>
+      </section>
+
+      <section class="page" id="page-settings">
+        <article class="card settings-card">
+          <div class="setting-copy"><h2>总流量</h2><p id="traffic-summary">未设置总流量</p></div>
+          <button class="secondary" id="traffic-button">设置总流量</button>
+        </article>
+        <article class="card settings-card danger-hint">
+          <div class="setting-copy"><h2>网页管理</h2><p>管理密码保护网页设置和控制接口，会话在 24 小时无活动后失效。</p></div>
+          <div class="button-group"><button class="secondary" id="password-button">修改密码</button><button class="secondary" id="logout-button">退出登录</button></div>
+        </article>
+        <article class="card warning-card">
+          <span aria-hidden="true">!</span><div><h2>HTTP 安全提示</h2><p>此服务默认允许局域网访问，但不加密传输。请仅在可信局域网使用；如需公网访问，请在前方配置 HTTPS 反向代理并限制来源。</p></div>
+        </article>
+        <article class="card activity-card">
+          <div class="section-title"><div><h2>最近活动</h2><p>仅记录脱敏后的运行状态，日志保留 30 天。</p></div><a class="secondary button-link" href="/api/logs/download">下载今日日志</a></div>
+          <ol id="activity-list"><li class="empty">暂无活动记录</li></ol>
+        </article>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-backdrop" id="modal-backdrop" hidden>
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div class="modal-head"><div><h2 id="modal-title"></h2><p id="modal-hint"></p></div><button class="close-button" id="modal-close" aria-label="关闭">×</button></div>
+      <form id="modal-form"><div id="modal-body"></div><p class="form-error" id="modal-error" role="alert"></p><div class="modal-actions"><button class="secondary" type="button" id="modal-cancel">取消</button><button class="primary" type="submit" id="modal-save">保存</button></div></form>
+    </section>
+  </div>
+  <div class="toast" id="toast" role="status" hidden></div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

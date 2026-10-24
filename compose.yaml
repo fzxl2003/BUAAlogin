@@ -1,0 +1,11 @@
+services:
+  buaalogin:
+    image: ghcr.io/owner/repo:native-preview
+    container_name: buaalogin
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - buaalogin-data:/data
+
+volumes:
+  buaalogin-data:
