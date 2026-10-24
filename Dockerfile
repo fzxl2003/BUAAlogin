@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libcurl4 ca-cer
 RUN install -d -o 65532 -g 65532 -m 0700 /data
 COPY --from=build /src/target/release/buaalogin-web /usr/local/bin/buaalogin-web
 VOLUME ["/data"]
-EXPOSE 8080
+EXPOSE 18799
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 CMD ["/usr/local/bin/buaalogin-web", "healthcheck"]
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/buaalogin-web"]

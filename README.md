@@ -30,7 +30,7 @@ docker run -d --name buaalogin --restart unless-stopped --network host \
 docker logs buaalogin
 ```
 
-镜像支持 Linux amd64/arm64，默认监听 `0.0.0.0:8080`。首次启动后，从 `docker logs buaalogin` 复制一次性设置码，打开 `http://服务器地址:8080` 创建网页管理密码。镜像以 UID/GID 65532 非 root 用户运行，配置、凭据和最近 30 天日志存放在 `/data`；务必挂载数据卷，否则重建容器后会重新进入首次设置。
+镜像支持 Linux amd64/arm64，默认监听 `0.0.0.0:18799`。首次启动后，从 `docker logs buaalogin` 复制一次性设置码，打开 `http://服务器地址:18799` 创建网页管理密码。镜像以 UID/GID 65532 非 root 用户运行，配置、凭据和最近 30 天日志存放在 `/data`；务必挂载数据卷，否则重建容器后会重新进入首次设置。
 
 仓库的 [`compose.yaml`](compose.yaml) 是 host-network 示例。使用原生 Linux host 网络时，服务才能直接看到宿主机校园网接口；macOS/Windows Docker Desktop 的虚拟网络不等价于宿主机接口。接口留空表示自动选择，显式多选后每个接口独立维护认证会话并使用自己的可选网关。容器会标注 Wi‑Fi/有线类型，但不能扫描、切换或连接宿主机 Wi‑Fi。
 

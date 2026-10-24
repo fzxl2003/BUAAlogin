@@ -32,7 +32,7 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
-    let bind = env::var("WEB_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    let bind = env::var("WEB_BIND").unwrap_or_else(|_| "0.0.0.0:18799".into());
     let address: SocketAddr = bind.parse().map_err(|_| "WEB_BIND 必须是 IP:端口")?;
     let root = PathBuf::from(env::var_os("BUAA_DATA_DIR").unwrap_or_else(|| "/data".into()));
     let storage = Storage::new(root)?;
@@ -134,7 +134,7 @@ async fn shutdown_signal() {
 }
 
 fn healthcheck() -> bool {
-    let bind = env::var("WEB_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    let bind = env::var("WEB_BIND").unwrap_or_else(|_| "0.0.0.0:18799".into());
     let Ok(mut address) = bind.parse::<SocketAddr>() else {
         return false;
     };
