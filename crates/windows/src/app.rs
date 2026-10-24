@@ -5,6 +5,8 @@ use buaa_core::{
 };
 use std::{
     cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
+    net::Ipv4Addr,
     path::PathBuf,
     ptr::{null, null_mut},
     sync::mpsc::{self, Receiver},
@@ -28,12 +30,9 @@ use windows_sys::Win32::{
 const EVENTS: u32 = WM_APP + 1;
 const TRAY: u32 = WM_APP + 2;
 const WIFI_EVENTS: u32 = WM_APP + 3;
-const WIFI_ADAPTER: usize = 30;
-const WIFI_AUTO: usize = 31;
+const MODAL_COMMAND: u32 = WM_APP + 20;
+const MODAL_CLOSE: u32 = WM_APP + 21;
 const PAGES: usize = 32;
-const ADVANCED: usize = 33;
-const HISTORY: usize = 34;
-const SETTINGS_START: usize = 35;
 const AUTOSTART: usize = 36;
 const REPAIR: usize = 37;
 const WEB_REPAIR: usize = 38;
@@ -45,6 +44,8 @@ const TEST_CONNECTIVITY: usize = 44;
 const TEST_BROWSER: usize = 45;
 const OPEN_LOGS: usize = 46;
 const CONNECTION_SETTINGS: usize = 47;
+const ACCOUNT_SETTINGS: usize = 48;
+const SAVE_SETTINGS: usize = 49;
 const START: usize = 10;
 const STOP: usize = 11;
 const SCAN: usize = 12;
@@ -52,6 +53,15 @@ const HIDE: usize = 13;
 const SHOW: usize = 14;
 const QUIT: usize = 15;
 const REMEMBER: usize = 16;
+
+#[derive(Clone)]
+struct InterfaceOption {
+    binding: String,
+    name: String,
+    label: String,
+    message: String,
+    wifi_id: Option<String>,
+}
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
@@ -65,7 +75,6 @@ struct App {
     interfaces: HWND,
     remember: HWND,
     start: HWND,
-    stop: HWND,
     repair: HWND,
     web_repair: HWND,
     browser_fallback: HWND,
@@ -78,21 +87,20 @@ struct App {
     scan: HWND,
     status: HWND,
     history: HWND,
+    traffic_progress: HWND,
+    traffic_label: HWND,
+    traffic_total: HWND,
+    account_value: HWND,
     tabs: HWND,
     page_controls: RefCell<Vec<(HWND, usize)>>,
     building_page: Cell<Option<usize>>,
-    building_advanced: Cell<bool>,
-    advanced_controls: RefCell<Vec<HWND>>,
     settings_positions: RefCell<Vec<ControlPosition>>,
     settings_pane: HWND,
     settings_scroll: i32,
     active_page: usize,
-    advanced_expanded: bool,
-    settings_start: HWND,
-    settings_hint: HWND,
     startup: HWND,
     history_button: HWND,
-    dashboard_values: [HWND; 5],
+    dashboard_values: [HWND; 6],
     state_title: HWND,
     state_icon: HWND,
     palette: Palette,
@@ -102,8 +110,10 @@ struct App {
     heading_font: HFONT,
     dpi: i32,
     scroll: i32,
-    history_expanded: bool,
-    bindings: Vec<Option<String>>,
+    selected_bindings: HashSet<String>,
+    interface_gateways: HashMap<String, Ipv4Addr>,
+    interface_options: Vec<InterfaceOption>,
+    traffic_used_bytes: Option<u64>,
     lines: Vec<String>,
     handle: Option<Handle>,
     receiver: Option<Receiver<Event>>,
@@ -113,10 +123,8 @@ struct App {
     tray: NOTIFYICONDATAW,
     font: HFONT,
     power: windows_sys::Win32::System::Power::HPOWERNOTIFY,
-    wifi_adapter: HWND,
-    wifi_auto: HWND,
     wifi_options: Vec<crate::wifi::Adapter>,
-    wifi_enabled: std::collections::HashSet<String>,
+    wifi_networks: HashMap<String, HashSet<String>>,
     wifi: Option<crate::wifi::Wifi>,
 }
 impl App {
@@ -130,7 +138,6 @@ impl App {
             interfaces: null_mut(),
             remember: null_mut(),
             start: null_mut(),
-            stop: null_mut(),
             repair: null_mut(),
             web_repair: null_mut(),
             browser_fallback: null_mut(),
@@ -143,21 +150,20 @@ impl App {
             scan: null_mut(),
             status: null_mut(),
             history: null_mut(),
+            traffic_progress: null_mut(),
+            traffic_label: null_mut(),
+            traffic_total: null_mut(),
+            account_value: null_mut(),
             tabs: null_mut(),
             page_controls: RefCell::new(Vec::new()),
             building_page: Cell::new(None),
-            building_advanced: Cell::new(false),
-            advanced_controls: RefCell::new(Vec::new()),
             settings_positions: RefCell::new(Vec::new()),
             settings_pane: null_mut(),
             settings_scroll: 0,
             active_page: 0,
-            advanced_expanded: false,
-            settings_start: null_mut(),
-            settings_hint: null_mut(),
             startup: null_mut(),
             history_button: null_mut(),
-            dashboard_values: [null_mut(); 5],
+            dashboard_values: [null_mut(); 6],
             state_title: null_mut(),
             state_icon: null_mut(),
             palette: unsafe { Palette::system() },
@@ -167,8 +173,10 @@ impl App {
             heading_font: null_mut(),
             dpi: 96,
             scroll: 0,
-            history_expanded: false,
-            bindings: vec![],
+            selected_bindings: HashSet::new(),
+            interface_gateways: HashMap::new(),
+            interface_options: vec![],
+            traffic_used_bytes: None,
             lines: vec![],
             handle: None,
             receiver: None,
@@ -178,10 +186,8 @@ impl App {
             tray: unsafe { std::mem::zeroed() },
             font: null_mut(),
             power: 0,
-            wifi_adapter: null_mut(),
-            wifi_auto: null_mut(),
             wifi_options: vec![],
-            wifi_enabled: std::collections::HashSet::new(),
+            wifi_networks: HashMap::new(),
             wifi: None,
         }
     }
@@ -241,9 +247,6 @@ impl App {
             self.settings_positions
                 .borrow_mut()
                 .push((hwnd, x, y, width, height));
-            if self.building_advanced.get() {
-                self.advanced_controls.borrow_mut().push(hwnd);
-            }
         }
         SendMessageW(hwnd, WM_SETFONT, self.font as usize, 1);
         SetWindowTheme(hwnd, wide("Explorer").as_ptr(), null());
@@ -270,33 +273,25 @@ impl App {
         appearance::fill(dc, &area, if settings { p.surface } else { p.background });
         if settings {
             for (control, x, y, width, height) in [
-                (self.username, 170, 82, 394, 30),
-                (self.password, 170, 126, 394, 30),
-                (self.interval, 170, 356, 86, 30),
-                (self.gateway, 170, 454, 220, 30),
+                (self.traffic_total, 170, 90, 180, 30),
+                (self.browser_path, 20, 216, 544, 30),
             ] {
-                if control != self.gateway || self.advanced_expanded {
-                    appearance::rounded(
-                        dc,
-                        &self.rect(x, y, width, height, self.settings_scroll),
-                        self.px(8),
-                        p.surface,
-                        if GetFocus() == control {
-                            p.accent
-                        } else {
-                            p.border
-                        },
-                    );
-                }
+                appearance::rounded(
+                    dc,
+                    &self.rect(x, y, width, height, self.settings_scroll),
+                    self.px(8),
+                    p.surface,
+                    if GetFocus() == control {
+                        p.accent
+                    } else {
+                        p.border
+                    },
+                );
             }
-            let y = self.px(268) - self.settings_scroll;
+            let y = self.px(296) - self.settings_scroll;
             appearance::line(dc, self.px(20), y, self.px(564), y, p.border);
-            if self.advanced_expanded {
-                let y = self.px(442) - self.settings_scroll;
-                appearance::line(dc, self.px(20), y, self.px(564), y, p.border);
-            }
         } else if self.active_page == 0 {
-            for (y, height) in [(80, 98), (188, 166), (404, 100)] {
+            for (y, height) in [(80, 98), (188, 118), (318, 126)] {
                 appearance::rounded(
                     dc,
                     &self.rect(32, y, 616, height, self.scroll),
@@ -305,15 +300,6 @@ impl App {
                     p.border,
                 );
             }
-            let x = self.px(340);
-            appearance::line(
-                dc,
-                x,
-                self.px(204) - self.scroll,
-                x,
-                self.px(338) - self.scroll,
-                p.border,
-            );
         }
         RestoreDC(dc, saved);
         EndPaint(hwnd, &ps);
@@ -429,7 +415,7 @@ impl App {
                 item.itemState & ODS_SELECTED != 0
             };
             let disabled = item.itemState & ODS_DISABLED != 0;
-            let primary = item.CtlID as usize == START || item.CtlID as usize == SETTINGS_START;
+            let primary = item.CtlID as usize == START;
             let background = if GetParent(item.hwndItem) == self.settings_pane {
                 p.surface
             } else {
@@ -482,11 +468,7 @@ impl App {
             );
             let mut chars = [0u16; 256];
             let len = if tab {
-                let label = if item.itemID == 0 {
-                    "连接"
-                } else {
-                    "账号设置"
-                };
+                let label = if item.itemID == 0 { "连接" } else { "设置" };
                 let mut count = 0;
                 for ch in label.encode_utf16() {
                     chars[count] = ch;
@@ -520,7 +502,7 @@ impl App {
         appearance::fill(dc, &area, p.background);
         appearance::rounded(dc, &area, self.px(12), p.soft, p.soft);
         SetBkMode(dc, TRANSPARENT as i32);
-        for (index, title) in ["连接", "账号设置"].iter().enumerate() {
+        for (index, title) in ["连接", "设置"].iter().enumerate() {
             let mut rect: RECT = std::mem::zeroed();
             SendMessageW(hwnd, TCM_GETITEMRECT, index, &mut rect as *mut _ as isize);
             let selected = index == self.active_page;
@@ -614,7 +596,7 @@ impl App {
             ((self.px(32) as isize) << 16) | self.px(134) as isize,
         );
         SendMessageW(self.tabs, TCM_SETPADDING, 0, 0);
-        for (index, title) in ["连接", "账号设置"].iter().enumerate() {
+        for (index, title) in ["连接", "设置"].iter().enumerate() {
             let mut title = wide(title);
             let item = TCITEMW {
                 mask: TCIF_TEXT,
@@ -655,7 +637,7 @@ impl App {
         SendMessageW(self.state_title, WM_SETFONT, self.title_font as usize, 1);
         self.status = self.control(
             "STATIC",
-            "先在账号设置中填写凭据，再开始自动连接。",
+            "请设置账号并检测校园网接口。",
             0,
             120,
             135,
@@ -664,9 +646,16 @@ impl App {
             0,
         );
         self.update_state("idle");
-        for (index, title) in ["当前接口", "本地 IP", "校园网 IP", "上次检查", "检查周期"]
-            .iter()
-            .enumerate()
+        for (index, title) in [
+            "账号",
+            "当前接口",
+            "检查周期",
+            "上次检查",
+            "本地 IP",
+            "校园网 IP",
+        ]
+        .iter()
+        .enumerate()
         {
             let x = 32 + (index as i32 % 3) * 205;
             let y = 174 + (index as i32 / 3) * 46;
@@ -680,31 +669,59 @@ impl App {
                 1,
             );
         }
-        SetWindowPos(
-            self.dashboard_values[0],
-            null_mut(),
-            0,
-            0,
-            self.px(84),
-            self.px(24),
-            SWP_NOMOVE | SWP_NOZORDER,
+        self.account_value = self.dashboard_values[0];
+        for control in [self.dashboard_values[0], self.dashboard_values[1]] {
+            SetWindowPos(
+                control,
+                null_mut(),
+                0,
+                0,
+                self.px(84),
+                self.px(24),
+                SWP_NOMOVE | SWP_NOZORDER,
+            );
+        }
+        self.control(
+            "BUTTON",
+            "设置…",
+            WS_TABSTOP,
+            137,
+            193,
+            70,
+            27,
+            ACCOUNT_SETTINGS,
         );
         self.control(
             "BUTTON",
-            "连接设置…",
+            "接口设置…",
             WS_TABSTOP,
-            122,
+            328,
             193,
-            96,
+            106,
             27,
             CONNECTION_SETTINGS,
+        );
+
+        self.label("流量使用情况", 48, 272, 160);
+        self.traffic_progress =
+            self.control("msctls_progress32", "", PBS_SMOOTH, 48, 294, 584, 12, 0);
+        SendMessageW(self.traffic_progress, PBM_SETRANGE32, 0, 1000);
+        self.traffic_label = self.control(
+            "STATIC",
+            "尚未获取流量",
+            SS_ENDELLIPSIS,
+            208,
+            272,
+            424,
+            24,
+            0,
         );
         self.portal_auth = self.control(
             "BUTTON",
             "校园网认证（普通连接）",
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
             32,
-            290,
+            334,
             190,
             25,
             PORTAL_AUTH,
@@ -714,7 +731,7 @@ impl App {
             "外网可用性检测",
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
             32,
-            326,
+            370,
             190,
             25,
             CONNECTIVITY_PROBE,
@@ -724,7 +741,7 @@ impl App {
             "网页兜底",
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
             32,
-            362,
+            406,
             190,
             25,
             BROWSER_FALLBACK,
@@ -736,7 +753,7 @@ impl App {
         ] {
             SendMessageW(control, BM_SETCHECK, BST_CHECKED as usize, 0);
         }
-        for (index, y) in [290, 326, 362].iter().enumerate() {
+        for (index, y) in [334, 370, 406].iter().enumerate() {
             self.task_results[index] =
                 self.control("STATIC", "尚未运行", SS_ENDELLIPSIS, 228, *y, 170, 24, 0);
             self.task_next[index] = self.control(
@@ -760,14 +777,110 @@ impl App {
                 TEST_PORTAL + index,
             );
         }
-        let recent = self.label("最近活动", 32, 402, 300);
+        self.start = self.control(
+            "BUTTON",
+            "设置账号",
+            BS_DEFPUSHBUTTON as u32 | WS_TABSTOP,
+            462,
+            462,
+            186,
+            38,
+            START,
+        );
+
+        // These hidden native controls keep sensitive/configuration values out of the
+        // main pages. They are edited through the account and interface dialogs.
+        self.building_page.set(Some(2));
+        self.username = self.control("EDIT", "", ES_AUTOHSCROLL as u32, 0, 0, 1, 1, 20);
+        self.password = self.control("EDIT", "", ES_PASSWORD as u32, 0, 0, 1, 1, 21);
+        self.remember = self.control("BUTTON", "", BS_AUTOCHECKBOX as u32, 0, 0, 1, 1, REMEMBER);
+        SendMessageW(self.remember, BM_SETCHECK, BST_CHECKED as usize, 0);
+        self.interval = self.control("EDIT", "300", ES_NUMBER as u32, 0, 0, 1, 1, 22);
+        self.gateway = self.control("EDIT", "10.200.21.4", ES_AUTOHSCROLL as u32, 0, 0, 1, 1, 24);
+        self.interfaces = null_mut();
+
+        self.building_page.set(Some(1));
+        let title = self.label("通用设置", 20, 14, 560);
+        SendMessageW(title, WM_SETFONT, self.heading_font as usize, 1);
+        self.startup = self.control(
+            "BUTTON",
+            "开机自启",
+            BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+            20,
+            48,
+            180,
+            24,
+            AUTOSTART,
+        );
+        self.control(
+            "STATIC",
+            "登录系统后自动启动；需先在账号弹窗中保存完整凭据。",
+            0,
+            210,
+            49,
+            354,
+            22,
+            0,
+        );
+        self.label("总流量（GB）", 20, 96, 140);
+        self.traffic_total = self.control(
+            "EDIT",
+            "",
+            WS_BORDER | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+            170,
+            90,
+            180,
+            30,
+            50,
+        );
+        self.label("留空时只显示已用流量，不计算百分比。", 368, 96, 196);
+        self.label("检查周期（秒）", 20, 146, 140);
+        let interval_setting = self.control(
+            "EDIT",
+            "300",
+            WS_BORDER | ES_NUMBER as u32 | WS_TABSTOP,
+            170,
+            140,
+            180,
+            30,
+            51,
+        );
+        SetWindowTextW(interval_setting, wide(&text(self.interval)).as_ptr());
+        self.label("10–86400", 368, 146, 196);
+        self.label(
+            "浏览器可执行文件（留空自动查找 Chrome / Edge / Chromium）",
+            20,
+            188,
+            544,
+        );
+        self.browser_path = self.control(
+            "EDIT",
+            "",
+            WS_BORDER | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+            20,
+            216,
+            544,
+            30,
+            40,
+        );
+        self.control(
+            "BUTTON",
+            "保存设置",
+            WS_TABSTOP,
+            444,
+            260,
+            120,
+            30,
+            SAVE_SETTINGS,
+        );
+        let recent = self.label("最近活动", 20, 314, 300);
         SendMessageW(recent, WM_SETFONT, self.heading_font as usize, 1);
         self.history_button = self.control(
             "BUTTON",
             "打开日志文件夹",
             WS_TABSTOP,
-            492,
-            397,
+            408,
+            306,
             156,
             30,
             OPEN_LOGS,
@@ -780,194 +893,30 @@ impl App {
                 | ES_AUTOVSCROLL as u32
                 | WS_VSCROLL
                 | WS_TABSTOP,
-            46,
-            435,
-            588,
-            145,
-            0,
-        );
-        self.start = self.control(
-            "BUTTON",
-            "设置账号",
-            BS_DEFPUSHBUTTON as u32 | WS_TABSTOP,
-            462,
-            630,
-            186,
-            38,
-            START,
-        );
-
-        self.building_page.set(Some(1));
-        let title = self.label("账号与启动", 20, 14, 560);
-        SendMessageW(title, WM_SETFONT, self.heading_font as usize, 1);
-        self.label(
-            "使用校园网账号登录，密码由应用内轻量加密保存。",
             20,
-            44,
-            560,
-        );
-        self.label("校园网账号", 20, 89, 140);
-        self.username = self.control(
-            "EDIT",
-            "",
-            WS_BORDER | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-            170,
-            82,
-            394,
-            30,
-            20,
-        );
-        SendMessageW(
-            self.username,
-            EM_SETCUEBANNER,
-            0,
-            wide("学号 / 工号").as_ptr() as isize,
-        );
-        self.label("校园网密码", 20, 133, 140);
-        self.password = self.control(
-            "EDIT",
-            "",
-            WS_BORDER | ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-            170,
-            126,
-            394,
-            30,
-            21,
-        );
-        SendMessageW(
-            self.password,
-            EM_SETCUEBANNER,
-            0,
-            wide("请输入校园网密码").as_ptr() as isize,
-        );
-        self.remember = self.control(
-            "BUTTON",
-            "记住账号密码",
-            BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            170,
-            170,
-            394,
-            24,
-            REMEMBER,
-        );
-        self.startup = self.control(
-            "BUTTON",
-            "开机自启",
-            BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            170,
-            204,
-            394,
-            24,
-            AUTOSTART,
-        );
-        self.control(
-            "STATIC",
-            "登录系统后自动连接，需先记住账号密码。",
-            0,
-            170,
-            236,
-            394,
-            22,
-            0,
-        );
-        let title = self.label("连接", 20, 278, 550);
-        SendMessageW(title, WM_SETFONT, self.heading_font as usize, 1);
-        self.label("校园网接口", 20, 318, 140);
-        self.interfaces = self.control(
-            "COMBOBOX",
-            "",
-            CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
-            170,
-            312,
-            270,
-            260,
-            23,
-        );
-        SendMessageW(
-            self.interfaces,
-            CB_ADDSTRING,
-            0,
-            wide("自动选择").as_ptr() as isize,
-        );
-        SendMessageW(self.interfaces, CB_SETCURSEL, 0, 0);
-        self.bindings = vec![None];
-        self.scan = self.control("BUTTON", "检测接口", WS_TABSTOP, 452, 310, 112, 30, SCAN);
-        self.label("检查间隔", 20, 363, 140);
-        self.interval = self.control(
-            "EDIT",
-            "300",
-            WS_BORDER | ES_NUMBER as u32 | WS_TABSTOP,
-            170,
-            356,
-            86,
-            30,
-            22,
-        );
-        self.label("秒 · 失败后逐步延长重试间隔", 272, 363, 292);
-        self.control(
-            "BUTTON",
-            "展开高级选项",
-            WS_TABSTOP,
-            20,
-            390,
-            154,
-            30,
-            ADVANCED,
-        );
-        self.building_advanced.set(true);
-        self.label("网关地址", 20, 460, 140);
-        self.gateway = self.control(
-            "EDIT",
-            "10.200.21.4",
-            WS_BORDER | WS_TABSTOP,
-            170,
-            454,
-            220,
-            30,
-            24,
-        );
-        self.label("通常无需修改", 406, 460, 158);
-        self.label("Wi-Fi 网卡", 20, 506, 140);
-        self.wifi_adapter = self.control(
-            "COMBOBOX",
-            "",
-            CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
-            170,
-            500,
-            394,
-            260,
-            WIFI_ADAPTER,
-        );
-        self.wifi_auto = self.control(
-            "BUTTON",
-            "发现 BUAA-WiFi 自动连接",
-            BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            170,
-            546,
-            394,
-            24,
-            WIFI_AUTO,
-        );
-        self.label(
-            "浏览器可执行文件（留空自动查找 Chrome / Edge / Chromium）",
-            20,
-            628,
+            352,
             544,
+            240,
+            0,
         );
-        self.browser_path = self.control(
-            "EDIT",
-            "",
-            WS_BORDER | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-            20,
-            658,
-            544,
-            30,
-            40,
-        );
-        self.building_advanced.set(false);
+        self.scan = null_mut();
         if let Ok(path) = wifi_path() {
             if let Ok(data) = std::fs::read(path) {
-                self.wifi_enabled = serde_json::from_slice(&data).unwrap_or_default();
+                self.wifi_networks = serde_json::from_slice(&data).unwrap_or_else(|_| {
+                    serde_json::from_slice::<HashSet<String>>(&data)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|id| {
+                            (
+                                id,
+                                HashSet::from([
+                                    "BUAA-WiFi".to_owned(),
+                                    "BUAA-WiFi-Free".to_owned(),
+                                ]),
+                            )
+                        })
+                        .collect()
+                });
             }
         }
         self.wifi = Some(crate::wifi::Wifi::new(self.window, WIFI_EVENTS));
@@ -1057,63 +1006,39 @@ impl App {
         self.active_page = index;
         SendMessageW(self.tabs, TCM_SETCURSEL, index, 0);
         for &(control, page) in self.page_controls.borrow().iter() {
-            let advanced = self.advanced_controls.borrow().contains(&control);
-            ShowWindow(
-                control,
-                if page == index && (!advanced || self.advanced_expanded) {
-                    SW_SHOW
-                } else {
-                    SW_HIDE
-                },
-            );
+            ShowWindow(control, if page == index { SW_SHOW } else { SW_HIDE });
         }
         ShowWindow(
             self.settings_pane,
             if index == 1 { SW_SHOW } else { SW_HIDE },
         );
-        if index == 0 {
+        if index == 1 {
             self.render_history();
         }
+        self.resize_for_page(index);
         SetFocus(self.tabs);
         InvalidateRect(self.tabs, null(), 1);
         InvalidateRect(self.window, null(), 1);
     }
-    unsafe fn toggle_history(&mut self) {
-        self.history_expanded = !self.history_expanded;
-        SetWindowTextW(
-            self.history_button,
-            wide(if self.history_expanded {
-                "收起完整记录"
-            } else {
-                "查看完整记录"
-            })
-            .as_ptr(),
+    unsafe fn resize_for_page(&self, index: usize) {
+        let style =
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VSCROLL | WS_CLIPCHILDREN;
+        let mut frame = RECT {
+            left: 0,
+            top: 0,
+            right: self.px(680),
+            bottom: self.px(if index == 0 { 540 } else { 660 }),
+        };
+        AdjustWindowRectEx(&mut frame, style, 0, 0);
+        SetWindowPos(
+            self.window,
+            null_mut(),
+            0,
+            0,
+            frame.right - frame.left,
+            frame.bottom - frame.top,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
         );
-        self.render_history();
-    }
-    unsafe fn toggle_advanced(&mut self) {
-        self.advanced_expanded = !self.advanced_expanded;
-        let button = GetDlgItem(self.settings_pane, ADVANCED as i32);
-        SetWindowTextW(
-            button,
-            wide(if self.advanced_expanded {
-                "收起高级选项"
-            } else {
-                "展开高级选项"
-            })
-            .as_ptr(),
-        );
-        for &control in self.advanced_controls.borrow().iter() {
-            ShowWindow(
-                control,
-                if self.advanced_expanded && self.active_page == 1 {
-                    SW_SHOW
-                } else {
-                    SW_HIDE
-                },
-            );
-        }
-        self.update_settings_scroll();
     }
     unsafe fn update_settings_scroll(&mut self) {
         if self.settings_pane.is_null() {
@@ -1125,7 +1050,7 @@ impl App {
             cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
             fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
             nMin: 0,
-            nMax: self.px(if self.advanced_expanded { 718 } else { 424 }) - 1,
+            nMax: self.px(612) - 1,
             nPage: (area.bottom - area.top).max(0) as u32,
             nPos: self.settings_scroll,
             nTrackPos: 0,
@@ -1170,9 +1095,20 @@ impl App {
         self.update_settings_scroll();
     }
     unsafe fn focus_setting(&mut self, field: HWND) {
+        if field == self.username || field == self.password {
+            self.show_account_dialog();
+            return;
+        }
+        if field == self.gateway {
+            self.show_interface_dialog();
+            return;
+        }
         self.show_page(1);
-        if field == self.gateway && !self.advanced_expanded {
-            self.toggle_advanced();
+        if field == self.interval {
+            let visible = GetDlgItem(self.settings_pane, 51);
+            SetFocus(visible);
+            SendMessageW(visible, EM_SETSEL, 0, -1);
+            return;
         }
         let y = self
             .settings_positions
@@ -1187,6 +1123,9 @@ impl App {
         SendMessageW(field, EM_SETSEL, 0, -1);
     }
     unsafe fn complete_configuration(&self) -> Option<Config> {
+        self.configuration(true)
+    }
+    unsafe fn configuration(&self, require_credentials: bool) -> Option<Config> {
         let config = Config {
             username: text(self.username).trim().into(),
             password: text(self.password).into(),
@@ -1200,14 +1139,11 @@ impl App {
                 == BST_CHECKED as isize,
             browser_path: Some(text(self.browser_path).trim().to_owned())
                 .filter(|path| !path.is_empty()),
-            interface: self
-                .bindings
-                .get(SendMessageW(self.interfaces, CB_GETCURSEL, 0, 0) as usize)
-                .cloned()
-                .flatten(),
+            interfaces: self.selected_bindings.iter().cloned().collect(),
+            interface_gateways: self.interface_gateways.clone(),
             ..Config::default()
         };
-        config.validate(true).ok()?;
+        config.validate(require_credentials).ok()?;
         Some(config)
     }
     unsafe fn startup_changed(&mut self) {
@@ -1239,29 +1175,6 @@ impl App {
             );
         }
     }
-    unsafe fn restore_binding(&mut self, binding: Option<&str>) {
-        let index = if let Some(binding) = binding {
-            if let Some(index) = self
-                .bindings
-                .iter()
-                .position(|b| b.as_deref() == Some(binding))
-            {
-                index
-            } else {
-                SendMessageW(
-                    self.interfaces,
-                    CB_ADDSTRING,
-                    0,
-                    wide(&format!("指定接口 · {}", binding)).as_ptr() as isize,
-                );
-                self.bindings.push(Some(binding.into()));
-                self.bindings.len() - 1
-            }
-        } else {
-            0
-        };
-        SendMessageW(self.interfaces, CB_SETCURSEL, index, 0);
-    }
     unsafe fn update_start_title(&self) {
         if self.start.is_null() {
             return;
@@ -1282,9 +1195,16 @@ impl App {
             })
             .as_ptr(),
         );
-        if !self.dashboard_values[4].is_null() && self.handle.is_none() {
+        let username = text(self.username);
+        let account = if username.trim().is_empty() {
+            "未设置"
+        } else {
+            username.trim()
+        };
+        SetWindowTextW(self.account_value, wide(account).as_ptr());
+        if !self.dashboard_values[2].is_null() && self.handle.is_none() {
             SetWindowTextW(
-                self.dashboard_values[4],
+                self.dashboard_values[2],
                 wide(&format!("{} 秒", text(self.interval))).as_ptr(),
             );
         }
@@ -1308,18 +1228,27 @@ impl App {
     unsafe fn apply_dashboard(&mut self, snapshot: &DashboardSnapshot, message: &str) {
         self.update_state(&snapshot.phase);
         let values = [
+            if text(self.username).trim().is_empty() {
+                "未设置".into()
+            } else {
+                text(self.username).trim().into()
+            },
             snapshot.interface.clone().unwrap_or_else(|| "—".into()),
+            format!("{} 秒", snapshot.interval),
+            local_time(snapshot.last_check_at),
             snapshot
                 .local_ip
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "—".into()),
             snapshot.campus_ip.clone().unwrap_or_else(|| "—".into()),
-            local_time(snapshot.last_check_at),
-            format!("{} 秒", snapshot.interval),
         ];
         for (control, value) in self.dashboard_values.iter().zip(values) {
             SetWindowTextW(*control, wide(&value).as_ptr());
         }
+        if let Some(used) = snapshot.traffic_used_bytes {
+            self.traffic_used_bytes = Some(used);
+        }
+        self.update_traffic();
         if snapshot.phase != "stopped" {
             for (index, task) in [
                 &snapshot.tasks.portal_auth,
@@ -1368,7 +1297,7 @@ impl App {
             cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
             fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
             nMin: 0,
-            nMax: self.px(700) - 1,
+            nMax: self.px(if self.active_page == 0 { 540 } else { 660 }) - 1,
             nPage: (area.bottom - area.top).max(0) as u32,
             nPos: self.scroll,
             nTrackPos: 0,
@@ -1403,11 +1332,7 @@ impl App {
         );
     }
     unsafe fn render_history(&self) {
-        let start = if self.history_expanded {
-            0
-        } else {
-            self.lines.len().saturating_sub(5)
-        };
+        let start = self.lines.len().saturating_sub(40);
         let text = if self.lines.is_empty() {
             "暂无活动记录".into()
         } else {
@@ -1441,7 +1366,7 @@ impl App {
         if self.lines.len() > 120 {
             self.lines.remove(0);
         }
-        if self.active_page == 0 {
+        if self.active_page == 1 {
             self.render_history();
         }
     }
@@ -1565,9 +1490,7 @@ impl App {
             self.connectivity_probe,
             self.browser_fallback,
             self.browser_path,
-            self.interfaces,
             self.remember,
-            self.scan,
         ] {
             EnableWindow(c, (!busy) as i32);
         }
@@ -1578,16 +1501,6 @@ impl App {
         for button in self.test_buttons {
             EnableWindow(button, self.testing.is_none() as i32);
         }
-        EnableWindow(self.settings_start, (!busy) as i32);
-        SetWindowTextW(
-            self.settings_hint,
-            wide(if busy {
-                "修改配置，请先到仪表盘停止。"
-            } else {
-                "开始时保存并应用设置。"
-            })
-            .as_ptr(),
-        );
         self.update_start_title();
     }
     unsafe fn start_worker(&mut self, scan: bool) {
@@ -1628,7 +1541,6 @@ impl App {
                 return;
             }
         };
-        let selected = SendMessageW(self.interfaces, CB_GETCURSEL, 0, 0) as usize;
         let config = Config {
             username: if scan {
                 String::new()
@@ -1650,10 +1562,15 @@ impl App {
                 == BST_CHECKED as isize,
             browser_path: Some(text(self.browser_path).trim().to_owned())
                 .filter(|path| !path.is_empty()),
-            interface: if scan {
-                None
+            interfaces: if scan {
+                vec![]
             } else {
-                self.bindings.get(selected).cloned().flatten()
+                self.selected_bindings.iter().cloned().collect()
+            },
+            interface_gateways: if scan {
+                HashMap::new()
+            } else {
+                self.interface_gateways.clone()
             },
             ..Config::default()
         };
@@ -1697,7 +1614,7 @@ impl App {
                 self.scanning = scan;
                 self.update_state("checking");
                 if let Some(wifi) = &self.wifi {
-                    wifi.configure(self.wifi_enabled.clone(), !scan);
+                    wifi.configure(self.wifi_networks.clone(), !scan);
                 }
                 self.busy(true);
                 if !scan {
@@ -1733,44 +1650,51 @@ impl App {
                 self.update_state(&event.state);
             }
             if event.state == "interfaces" {
-                let old = self
-                    .bindings
-                    .get(SendMessageW(self.interfaces, CB_GETCURSEL, 0, 0) as usize)
-                    .cloned()
-                    .flatten();
-                SendMessageW(self.interfaces, CB_RESETCONTENT, 0, 0);
-                SendMessageW(
-                    self.interfaces,
-                    CB_ADDSTRING,
-                    0,
-                    wide("自动选择").as_ptr() as isize,
-                );
-                self.bindings = vec![None];
-                let mut selected = 0;
-                for row in event.records.unwrap_or_default() {
-                    let index = self.bindings.len();
-                    if old.as_ref() == Some(&row.binding) {
-                        selected = index;
+                self.refresh_wifi_options();
+                self.interface_options = event
+                    .records
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|row| {
+                        let wifi = self.wifi_options.iter().find(|wifi| {
+                            wifi.binding.eq_ignore_ascii_case(&row.interface.name)
+                                || wifi.name.eq_ignore_ascii_case(&row.interface.name)
+                        });
+                        InterfaceOption {
+                            binding: row.binding,
+                            name: row.interface.name,
+                            label: row.label,
+                            message: row.message,
+                            wifi_id: wifi.map(|wifi| wifi.id.clone()),
+                        }
+                    })
+                    .collect();
+                let existing: HashSet<_> = self
+                    .interface_options
+                    .iter()
+                    .map(|row| row.name.to_lowercase())
+                    .collect();
+                for wifi in &self.wifi_options {
+                    if !existing.contains(&wifi.binding.to_lowercase())
+                        && !existing.contains(&wifi.name.to_lowercase())
+                    {
+                        self.interface_options.push(InterfaceOption {
+                            binding: wifi.binding.clone(),
+                            name: wifi.binding.clone(),
+                            label: wifi.binding.clone(),
+                            message: "未获取 IP，可配置自动连接".into(),
+                            wifi_id: Some(wifi.id.clone()),
+                        });
                     }
-                    self.bindings.push(Some(row.binding));
-                    SendMessageW(
-                        self.interfaces,
-                        CB_ADDSTRING,
-                        0,
-                        wide(&format!("{} · {}", row.label, row.message)).as_ptr() as isize,
-                    );
                 }
-                if old.is_some() && selected == 0 {
-                    self.restore_binding(old.as_deref());
-                } else {
-                    SendMessageW(self.interfaces, CB_SETCURSEL, selected, 0);
-                }
+                self.interface_options
+                    .sort_by_key(|row| (row.wifi_id.is_none(), row.name.clone()));
             }
             if event.state == "stopped" {
                 let was_scanning = self.scanning;
                 self.scanning = false;
                 if let Some(wifi) = &self.wifi {
-                    wifi.configure(self.wifi_enabled.clone(), false);
+                    wifi.configure(self.wifi_networks.clone(), false);
                 }
                 self.handle.take();
                 self.receiver.take();
@@ -1822,7 +1746,7 @@ impl App {
     }
     unsafe fn stop_worker(&mut self) {
         if let Some(wifi) = &self.wifi {
-            wifi.configure(self.wifi_enabled.clone(), false);
+            wifi.configure(self.wifi_networks.clone(), false);
         }
         if let Some(h) = &self.handle {
             h.signal.stop();
@@ -1869,91 +1793,710 @@ impl App {
         DestroyMenu(menu);
     }
     unsafe fn refresh_wifi_options(&mut self) {
-        let selected = self
-            .wifi_options
-            .get(SendMessageW(self.wifi_adapter, CB_GETCURSEL, 0, 0) as usize)
-            .map(|a| a.id.clone());
         self.wifi_options = crate::wifi::adapters().unwrap_or_default();
-        SendMessageW(self.wifi_adapter, CB_RESETCONTENT, 0, 0);
-        let mut index = 0;
-        for (i, adapter) in self.wifi_options.iter().enumerate() {
-            SendMessageW(
-                self.wifi_adapter,
-                CB_ADDSTRING,
-                0,
-                wide(&format!("{} · {}", adapter.name, &adapter.id[..8])).as_ptr() as isize,
-            );
-            if selected.as_ref() == Some(&adapter.id) {
-                index = i;
+        let existing: HashSet<_> = self
+            .interface_options
+            .iter()
+            .map(|row| row.name.to_lowercase())
+            .collect();
+        for wifi in &self.wifi_options {
+            if !existing.contains(&wifi.binding.to_lowercase())
+                && !existing.contains(&wifi.name.to_lowercase())
+            {
+                self.interface_options.push(InterfaceOption {
+                    binding: wifi.binding.clone(),
+                    name: wifi.binding.clone(),
+                    label: wifi.binding.clone(),
+                    message: "未获取 IP，可配置自动连接".into(),
+                    wifi_id: Some(wifi.id.clone()),
+                });
             }
         }
-        if self.wifi_options.is_empty() {
-            SendMessageW(
-                self.wifi_adapter,
-                CB_ADDSTRING,
-                0,
-                wide("未发现 Wi-Fi 网卡").as_ptr() as isize,
-            );
-        }
-        SendMessageW(self.wifi_adapter, CB_SETCURSEL, index, 0);
-        SendMessageW(self.wifi_adapter, CB_SETDROPPEDWIDTH, 400, 0);
-        self.show_wifi_option();
+        self.interface_options
+            .sort_by_key(|row| (row.wifi_id.is_none(), row.name.clone()));
     }
-    unsafe fn show_wifi_option(&self) {
-        let selected = self
-            .wifi_options
-            .get(SendMessageW(self.wifi_adapter, CB_GETCURSEL, 0, 0) as usize);
-        EnableWindow(self.wifi_auto, selected.is_some() as i32);
+    unsafe fn modal_window(&self, owner: HWND, title: &str, width: i32, height: i32) -> HWND {
+        let mut owner_rect: RECT = std::mem::zeroed();
+        GetWindowRect(owner, &mut owner_rect);
+        let width = self.px(width);
+        let height = self.px(height);
+        let dialog = CreateWindowExW(
+            WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+            wide("BUAALoginModalWindow").as_ptr(),
+            wide(title).as_ptr(),
+            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN,
+            owner_rect.left + ((owner_rect.right - owner_rect.left - width) / 2).max(0),
+            owner_rect.top + ((owner_rect.bottom - owner_rect.top - height) / 2).max(0),
+            width,
+            height,
+            owner,
+            null_mut(),
+            GetModuleHandleW(null()),
+            null(),
+        );
+        if !dialog.is_null() {
+            SetWindowSubclass(dialog, Some(modal_proc), 1, 0);
+        }
+        dialog
+    }
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn modal_control(
+        &self,
+        parent: HWND,
+        class: &str,
+        text_value: &str,
+        style: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        id: usize,
+    ) -> HWND {
+        let control = CreateWindowExW(
+            if class == "EDIT" { WS_EX_CLIENTEDGE } else { 0 },
+            wide(class).as_ptr(),
+            wide(text_value).as_ptr(),
+            WS_CHILD | WS_VISIBLE | style,
+            self.px(x),
+            self.px(y),
+            self.px(width),
+            self.px(height),
+            parent,
+            id as HMENU,
+            GetModuleHandleW(null()),
+            null(),
+        );
+        SendMessageW(control, WM_SETFONT, self.font as usize, 1);
+        control
+    }
+    unsafe fn show_account_dialog(&mut self) {
+        if self.handle.is_some() {
+            MessageBoxW(
+                self.window,
+                wide("请先停止自动连接再修改账号。").as_ptr(),
+                wide("账号设置").as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
+            return;
+        }
+        let dialog = self.modal_window(self.window, "账号设置", 500, 280);
+        if dialog.is_null() {
+            return;
+        }
+        self.modal_control(dialog, "STATIC", "校园网账号", 0, 24, 22, 440, 22, 0);
+        let username = self.modal_control(
+            dialog,
+            "EDIT",
+            &text(self.username),
+            ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+            24,
+            48,
+            440,
+            30,
+            9001,
+        );
+        self.modal_control(dialog, "STATIC", "校园网密码", 0, 24, 88, 440, 22, 0);
+        let password = self.modal_control(
+            dialog,
+            "EDIT",
+            &text(self.password),
+            ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+            24,
+            114,
+            440,
+            30,
+            9002,
+        );
+        let remember = self.modal_control(
+            dialog,
+            "BUTTON",
+            "记住账号密码（应用内轻量加密）",
+            BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+            24,
+            158,
+            330,
+            24,
+            9003,
+        );
         SendMessageW(
-            self.wifi_auto,
+            remember,
             BM_SETCHECK,
-            if selected.is_some_and(|a| self.wifi_enabled.contains(&a.id)) {
-                BST_CHECKED
-            } else {
-                BST_UNCHECKED
-            } as usize,
+            SendMessageW(self.remember, BM_GETCHECK, 0, 0) as usize,
             0,
         );
+        self.modal_control(dialog, "BUTTON", "取消", WS_TABSTOP, 270, 206, 90, 32, 2);
+        self.modal_control(
+            dialog,
+            "BUTTON",
+            "保存",
+            BS_DEFPUSHBUTTON as u32 | WS_TABSTOP,
+            372,
+            206,
+            92,
+            32,
+            1,
+        );
+        EnableWindow(self.window, 0);
+        ShowWindow(dialog, SW_SHOW);
+        SetForegroundWindow(dialog);
+        SetFocus(username);
+        let mut saved = false;
+        let mut message: MSG = std::mem::zeroed();
+        'messages: while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
+            if message.hwnd == dialog && message.message == MODAL_CLOSE {
+                break;
+            }
+            if message.hwnd == dialog && message.message == MODAL_COMMAND {
+                match message.wParam & 0xffff {
+                    2 => break 'messages,
+                    1 => {
+                        let name = text(username).trim().to_owned();
+                        let secret = text(password);
+                        if name.is_empty() || secret.is_empty() {
+                            MessageBoxW(
+                                dialog,
+                                wide("请输入账号和密码").as_ptr(),
+                                wide("账号设置").as_ptr(),
+                                MB_OK | MB_ICONINFORMATION,
+                            );
+                            continue;
+                        }
+                        SetWindowTextW(self.username, wide(&name).as_ptr());
+                        SetWindowTextW(self.password, wide(&secret).as_ptr());
+                        SendMessageW(
+                            self.remember,
+                            BM_SETCHECK,
+                            SendMessageW(remember, BM_GETCHECK, 0, 0) as usize,
+                            0,
+                        );
+                        if let Some(config) = self.complete_configuration() {
+                            if let Err(error) = self.save_credentials(&config) {
+                                MessageBoxW(
+                                    dialog,
+                                    wide(&error).as_ptr(),
+                                    wide("账号设置").as_ptr(),
+                                    MB_OK | MB_ICONERROR,
+                                );
+                                continue;
+                            }
+                        }
+                        saved = true;
+                        break 'messages;
+                    }
+                    _ => {}
+                }
+            }
+            if IsDialogMessageW(dialog, &message) == 0 {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        DestroyWindow(dialog);
+        EnableWindow(self.window, 1);
+        SetForegroundWindow(self.window);
+        self.update_start_title();
+        if saved {
+            self.record("账号设置已保存");
+        }
     }
-    unsafe fn wifi_option_changed(&mut self) {
-        let Some(adapter) =
-            self.wifi_options
-                .get(SendMessageW(self.wifi_adapter, CB_GETCURSEL, 0, 0) as usize)
-        else {
+    unsafe fn show_interface_detail_dialog(&mut self, owner: HWND, index: usize) {
+        let Some(option) = self.interface_options.get(index).cloned() else {
             return;
         };
-        let old = self.wifi_enabled.clone();
-        if SendMessageW(self.wifi_auto, BM_GETCHECK, 0, 0) == BST_CHECKED as isize {
-            self.wifi_enabled.insert(adapter.id.clone());
-        } else {
-            self.wifi_enabled.remove(&adapter.id);
+        let wifi_targets = option
+            .wifi_id
+            .as_ref()
+            .and_then(|id| self.wifi_networks.get(id))
+            .cloned()
+            .unwrap_or_default();
+        let height = if option.wifi_id.is_some() { 370 } else { 240 };
+        let dialog = self.modal_window(owner, &format!("接口详情 · {}", option.name), 500, height);
+        self.modal_control(
+            dialog,
+            "STATIC",
+            "自定义网关（留空使用默认网关）",
+            0,
+            24,
+            22,
+            440,
+            22,
+            0,
+        );
+        let gateway = self.modal_control(
+            dialog,
+            "EDIT",
+            &self
+                .interface_gateways
+                .get(&option.binding)
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+            24,
+            48,
+            270,
+            30,
+            9101,
+        );
+        let mut default_wifi = null_mut();
+        let mut free_wifi = null_mut();
+        let mut custom_enabled = null_mut();
+        let mut custom_name = null_mut();
+        if option.wifi_id.is_some() {
+            self.modal_control(dialog, "STATIC", "Wi-Fi 自动连接", 0, 24, 96, 300, 22, 0);
+            default_wifi = self.modal_control(
+                dialog,
+                "BUTTON",
+                "BUAA-WiFi",
+                BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+                24,
+                126,
+                220,
+                24,
+                9102,
+            );
+            free_wifi = self.modal_control(
+                dialog,
+                "BUTTON",
+                "BUAA-WiFi-Free",
+                BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+                24,
+                158,
+                220,
+                24,
+                9103,
+            );
+            custom_enabled = self.modal_control(
+                dialog,
+                "BUTTON",
+                "自定义 Wi-Fi 名称",
+                BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+                24,
+                190,
+                200,
+                24,
+                9104,
+            );
+            let custom = wifi_targets
+                .iter()
+                .find(|ssid| *ssid != "BUAA-WiFi" && *ssid != "BUAA-WiFi-Free")
+                .cloned()
+                .unwrap_or_default();
+            custom_name = self.modal_control(
+                dialog,
+                "EDIT",
+                &custom,
+                ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+                230,
+                188,
+                234,
+                30,
+                9105,
+            );
+            for (control, checked) in [
+                (default_wifi, wifi_targets.contains("BUAA-WiFi")),
+                (free_wifi, wifi_targets.contains("BUAA-WiFi-Free")),
+                (custom_enabled, !custom.is_empty()),
+            ] {
+                SendMessageW(
+                    control,
+                    BM_SETCHECK,
+                    if checked { BST_CHECKED } else { BST_UNCHECKED } as usize,
+                    0,
+                );
+            }
+            self.modal_control(
+                dialog,
+                "STATIC",
+                "校园网网页密码不会用于 Wi-Fi 连接。",
+                0,
+                24,
+                232,
+                440,
+                36,
+                0,
+            );
         }
-        let result = wifi_path().and_then(|path| {
-            std::fs::create_dir_all(path.parent().unwrap())
-                .map_err(|_| "无法创建 Wi-Fi 配置目录")?;
-            atomic_write(&path, &serde_json::to_vec(&self.wifi_enabled).unwrap())
-        });
-        if let Err(e) = result {
-            self.wifi_enabled = old;
-            self.show_wifi_option();
-            self.record(&e);
+        let button_y = height - 74;
+        self.modal_control(
+            dialog, "BUTTON", "取消", WS_TABSTOP, 270, button_y, 90, 32, 2,
+        );
+        self.modal_control(
+            dialog,
+            "BUTTON",
+            "保存",
+            BS_DEFPUSHBUTTON as u32 | WS_TABSTOP,
+            372,
+            button_y,
+            92,
+            32,
+            1,
+        );
+        EnableWindow(owner, 0);
+        ShowWindow(dialog, SW_SHOW);
+        SetForegroundWindow(dialog);
+        let mut message: MSG = std::mem::zeroed();
+        'messages: while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
+            if message.hwnd == dialog && message.message == MODAL_CLOSE {
+                break;
+            }
+            if message.hwnd == dialog && message.message == MODAL_COMMAND {
+                match message.wParam & 0xffff {
+                    2 => break 'messages,
+                    1 => {
+                        let value = text(gateway).trim().to_owned();
+                        if value.is_empty() {
+                            self.interface_gateways.remove(&option.binding);
+                        } else if let Ok(value) = value.parse() {
+                            self.interface_gateways
+                                .insert(option.binding.clone(), value);
+                        } else {
+                            MessageBoxW(
+                                dialog,
+                                wide("网关必须是 IPv4 地址").as_ptr(),
+                                wide("接口详情").as_ptr(),
+                                MB_OK | MB_ICONINFORMATION,
+                            );
+                            continue;
+                        }
+                        if let Some(wifi_id) = &option.wifi_id {
+                            let mut targets = HashSet::new();
+                            if SendMessageW(default_wifi, BM_GETCHECK, 0, 0) == BST_CHECKED as isize
+                            {
+                                targets.insert("BUAA-WiFi".into());
+                            }
+                            if SendMessageW(free_wifi, BM_GETCHECK, 0, 0) == BST_CHECKED as isize {
+                                targets.insert("BUAA-WiFi-Free".into());
+                            }
+                            let custom = text(custom_name).trim().to_owned();
+                            if SendMessageW(custom_enabled, BM_GETCHECK, 0, 0)
+                                == BST_CHECKED as isize
+                                && !custom.is_empty()
+                            {
+                                targets.insert(custom);
+                            }
+                            if targets.is_empty() {
+                                self.wifi_networks.remove(wifi_id);
+                            } else {
+                                self.wifi_networks.insert(wifi_id.clone(), targets);
+                            }
+                            let _ = self.persist_wifi_networks();
+                        }
+                        break 'messages;
+                    }
+                    _ => {}
+                }
+            }
+            if IsDialogMessageW(dialog, &message) == 0 {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        DestroyWindow(dialog);
+        EnableWindow(owner, 1);
+        SetForegroundWindow(owner);
+    }
+    unsafe fn show_interface_dialog(&mut self) {
+        if self.handle.is_some() {
+            MessageBoxW(
+                self.window,
+                wide("请先停止自动连接再修改接口。").as_ptr(),
+                wide("接口设置").as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
             return;
         }
+        self.refresh_wifi_options();
+        let rows_height = (self.interface_options.len() as i32 * 38).max(42);
+        let form_y = 68 + rows_height;
+        let dialog_height = form_y + 174;
+        let dialog = self.modal_window(self.window, "接口设置", 600, dialog_height);
+        self.modal_control(
+            dialog,
+            "STATIC",
+            "校园网接口（可多选）",
+            0,
+            24,
+            20,
+            340,
+            24,
+            0,
+        );
+        self.modal_control(
+            dialog,
+            "BUTTON",
+            "检测校园网",
+            WS_TABSTOP,
+            420,
+            16,
+            154,
+            32,
+            3,
+        );
+        let mut checks = Vec::new();
+        for (index, option) in self.interface_options.iter().enumerate() {
+            let kind = if option.wifi_id.is_some() {
+                "Wi-Fi"
+            } else {
+                "有线"
+            };
+            let check = self.modal_control(
+                dialog,
+                "BUTTON",
+                &format!("{} · {} · {}", kind, option.label, option.message),
+                BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+                24,
+                58 + index as i32 * 38,
+                462,
+                28,
+                9400 + index,
+            );
+            if self.selected_bindings.contains(&option.binding) {
+                SendMessageW(check, BM_SETCHECK, BST_CHECKED as usize, 0);
+            }
+            checks.push(check);
+            self.modal_control(
+                dialog,
+                "BUTTON",
+                "详情…",
+                WS_TABSTOP,
+                500,
+                56 + index as i32 * 38,
+                74,
+                30,
+                9300 + index,
+            );
+        }
+        if self.interface_options.is_empty() {
+            self.modal_control(
+                dialog,
+                "STATIC",
+                "尚未检测接口，请点击“检测校园网”。",
+                0,
+                24,
+                60,
+                500,
+                24,
+                0,
+            );
+        }
+        self.modal_control(
+            dialog,
+            "STATIC",
+            "未选择时自动选择；逐接口网关和 Wi-Fi 自动连接请进入详情。",
+            0,
+            24,
+            form_y,
+            550,
+            22,
+            0,
+        );
+        self.modal_control(
+            dialog,
+            "STATIC",
+            "默认网关地址",
+            0,
+            24,
+            form_y + 38,
+            140,
+            22,
+            0,
+        );
+        let gateway = self.modal_control(
+            dialog,
+            "EDIT",
+            &text(self.gateway),
+            ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+            170,
+            form_y + 32,
+            220,
+            30,
+            9202,
+        );
+        self.modal_control(
+            dialog,
+            "BUTTON",
+            "取消",
+            WS_TABSTOP,
+            370,
+            form_y + 88,
+            90,
+            32,
+            2,
+        );
+        self.modal_control(
+            dialog,
+            "BUTTON",
+            "完成",
+            BS_DEFPUSHBUTTON as u32 | WS_TABSTOP,
+            474,
+            form_y + 88,
+            100,
+            32,
+            1,
+        );
+        EnableWindow(self.window, 0);
+        ShowWindow(dialog, SW_SHOW);
+        SetForegroundWindow(dialog);
+        let mut run_scan = false;
+        let mut message: MSG = std::mem::zeroed();
+        'messages: while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
+            if message.hwnd == dialog && message.message == MODAL_CLOSE {
+                break;
+            }
+            if message.hwnd == dialog && message.message == MODAL_COMMAND {
+                match message.wParam & 0xffff {
+                    2 => break 'messages,
+                    3 => {
+                        run_scan = true;
+                        break 'messages;
+                    }
+                    1 => {
+                        let value = text(gateway).trim().to_owned();
+                        if value.parse::<Ipv4Addr>().is_err() {
+                            MessageBoxW(
+                                dialog,
+                                wide("默认网关必须是 IPv4 地址").as_ptr(),
+                                wide("接口设置").as_ptr(),
+                                MB_OK | MB_ICONINFORMATION,
+                            );
+                            continue;
+                        }
+                        SetWindowTextW(self.gateway, wide(&value).as_ptr());
+                        self.selected_bindings.clear();
+                        for (check, option) in checks.iter().zip(&self.interface_options) {
+                            if SendMessageW(*check, BM_GETCHECK, 0, 0) == BST_CHECKED as isize {
+                                self.selected_bindings.insert(option.binding.clone());
+                            }
+                        }
+                        if let Some(config) = self.configuration(false) {
+                            let _ = self.save_preferences(&config);
+                        }
+                        break 'messages;
+                    }
+                    id if (9300..9300 + self.interface_options.len()).contains(&id) => {
+                        self.show_interface_detail_dialog(dialog, id - 9300);
+                    }
+                    _ => {}
+                }
+            }
+            if IsDialogMessageW(dialog, &message) == 0 {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        DestroyWindow(dialog);
+        EnableWindow(self.window, 1);
+        SetForegroundWindow(self.window);
+        if run_scan {
+            self.start_worker(true);
+        }
+    }
+    unsafe fn persist_wifi_networks(&self) -> Result<(), String> {
+        let path = wifi_path()?;
+        std::fs::create_dir_all(path.parent().unwrap()).map_err(|_| "无法创建 Wi-Fi 配置目录")?;
+        atomic_write(&path, &serde_json::to_vec(&self.wifi_networks).unwrap())?;
         if let Some(wifi) = &self.wifi {
             wifi.configure(
-                self.wifi_enabled.clone(),
+                self.wifi_networks.clone(),
                 self.handle.is_some() && !self.scanning,
             );
         }
+        Ok(())
+    }
+    unsafe fn save_preferences(&self, config: &Config) -> Result<(), String> {
+        let path = credential_path()?;
+        std::fs::create_dir_all(path.parent().unwrap()).map_err(|_| "无法创建配置目录")?;
+        let settings = serde_json::json!({
+            "interval": config.interval,
+            "gateway": config.gateway_ip.to_string(),
+            "interfaces": config.interfaces,
+            "interface_gateways": config.interface_gateways.iter().map(|(key, value)| (key, value.to_string())).collect::<HashMap<_, _>>(),
+            "portal_auth_enabled": config.portal_auth_enabled,
+            "connectivity_probe_enabled": config.connectivity_probe_enabled,
+            "browser_fallback": config.browser_fallback,
+            "browser_path": config.browser_path,
+            "traffic_total_gb": text(self.traffic_total).trim(),
+        });
+        atomic_write(
+            &path.with_extension("settings.json"),
+            &serde_json::to_vec(&settings).unwrap(),
+        )
+    }
+    unsafe fn save_general_settings(&mut self) {
+        let visible_interval = GetDlgItem(self.settings_pane, 51);
+        let interval = text(visible_interval).trim().parse::<u64>().ok();
+        let total = text(self.traffic_total).trim().to_owned();
+        if interval.is_none() || !(10..=86400).contains(&interval.unwrap_or_default()) {
+            MessageBoxW(
+                self.window,
+                wide("检查周期须为 10–86400 的整数").as_ptr(),
+                wide("设置").as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
+            return;
+        }
+        if !total.is_empty()
+            && total
+                .parse::<f64>()
+                .ok()
+                .is_none_or(|value| !value.is_finite() || value <= 0.0)
+        {
+            MessageBoxW(
+                self.window,
+                wide("总流量请输入大于 0 的数字，或留空关闭百分比。").as_ptr(),
+                wide("设置").as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
+            return;
+        }
+        SetWindowTextW(self.interval, wide(&interval.unwrap().to_string()).as_ptr());
+        if let Some(handle) = &self.handle {
+            if let Err(error) = handle.signal.set_interval(interval.unwrap()) {
+                MessageBoxW(
+                    self.window,
+                    wide(&error).as_ptr(),
+                    wide("设置").as_ptr(),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+                return;
+            }
+        }
+        if let Some(config) = self.configuration(false) {
+            match self.save_preferences(&config) {
+                Ok(()) => self.record("设置已保存"),
+                Err(error) => self.record(&error),
+            }
+        }
+        self.update_start_title();
+        self.update_traffic();
+    }
+    unsafe fn update_traffic(&self) {
+        let total = text(self.traffic_total)
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .map(|value| value * 1_000_000_000.0);
+        let (label, progress) = match self.traffic_used_bytes {
+            Some(used) => {
+                let used_label = format_bytes(used);
+                match total {
+                    Some(total) => (
+                        format!("已用 {used_label} / {} GB", text(self.traffic_total).trim()),
+                        ((used as f64 / total).min(1.0) * 1000.0) as usize,
+                    ),
+                    None => (format!("已用 {used_label}"), 0),
+                }
+            }
+            None => ("尚未获取流量".into(), 0),
+        };
+        SetWindowTextW(self.traffic_label, wide(&label).as_ptr());
+        SendMessageW(self.traffic_progress, PBM_SETPOS, progress, 0);
     }
     unsafe fn save_credentials(&self, config: &Config) -> Result<(), String> {
         let path = credential_path()?;
         std::fs::create_dir_all(path.parent().unwrap()).map_err(|_| "无法创建配置目录")?;
-        let settings = serde_json::json!({"interval":config.interval,"gateway":config.gateway_ip.to_string(),"interface":config.interface,"portal_auth_enabled":config.portal_auth_enabled,"connectivity_probe_enabled":config.connectivity_probe_enabled,"browser_fallback":config.browser_fallback,"browser_path":config.browser_path});
-        atomic_write(
-            &path.with_extension("settings.json"),
-            &serde_json::to_vec(&settings).unwrap(),
-        )?;
+        self.save_preferences(config)?;
         if SendMessageW(self.remember, BM_GETCHECK, 0, 0) == BST_CHECKED as isize {
             let mut bytes = serde_json::to_vec(&serde_json::json!({"username":config.username,"password":config.password.as_str()})).unwrap();
             let encrypted = crate::credentials::encrypt(&bytes);
@@ -1972,6 +2515,10 @@ impl App {
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 if let Some(n) = v["interval"].as_u64() {
                     SetWindowTextW(self.interval, wide(&n.to_string()).as_ptr());
+                    SetWindowTextW(
+                        GetDlgItem(self.settings_pane, 51),
+                        wide(&n.to_string()).as_ptr(),
+                    );
                 }
                 if let Some(g) = v["gateway"].as_str() {
                     SetWindowTextW(self.gateway, wide(g).as_ptr());
@@ -2010,10 +2557,42 @@ impl App {
                     self.browser_path,
                     wide(v["browser_path"].as_str().unwrap_or("")).as_ptr(),
                 );
-                self.restore_binding(v["interface"].as_str());
+                SetWindowTextW(
+                    self.traffic_total,
+                    wide(v["traffic_total_gb"].as_str().unwrap_or("")).as_ptr(),
+                );
+                self.selected_bindings = v["interfaces"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .or_else(|| {
+                        v["interface"]
+                            .as_str()
+                            .map(|item| HashSet::from([item.to_owned()]))
+                    })
+                    .unwrap_or_default();
+                self.interface_gateways = v["interface_gateways"]
+                    .as_object()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|(key, value)| {
+                                value
+                                    .as_str()?
+                                    .parse()
+                                    .ok()
+                                    .map(|value| (key.clone(), value))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
             }
         }
-        if let Ok(mut bytes) = std::fs::read(&path) {
+        if let Ok(bytes) = std::fs::read(&path) {
             match crate::credentials::decrypt(&bytes) {
                 Ok(mut plain) => {
                     if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&plain) {
@@ -2038,6 +2617,7 @@ impl App {
                 Err(_) => self.record("应用内凭据无法解密，请重新输入"),
             }
         }
+        self.update_traffic();
         self.update_start_title();
     }
 }
@@ -2050,6 +2630,20 @@ unsafe fn text(hwnd: HWND) -> String {
 }
 fn wifi_path() -> Result<PathBuf, String> {
     Ok(credential_path()?.with_file_name("wifi.json"))
+}
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
 }
 fn credential_path() -> Result<PathBuf, String> {
     Ok(
@@ -2146,6 +2740,32 @@ fn local_time(timestamp: Option<u64>) -> String {
         }
     }
     "—".into()
+}
+unsafe extern "system" fn modal_proc(
+    hwnd: HWND,
+    message: u32,
+    w: WPARAM,
+    l: LPARAM,
+    id: usize,
+    _data: usize,
+) -> LRESULT {
+    match message {
+        WM_COMMAND => {
+            if w >> 16 == BN_CLICKED as usize {
+                PostMessageW(hwnd, MODAL_COMMAND, w & 0xffff, 0);
+            }
+            0
+        }
+        WM_CLOSE => {
+            PostMessageW(hwnd, MODAL_CLOSE, 0, 0);
+            0
+        }
+        WM_NCDESTROY => {
+            RemoveWindowSubclass(hwnd, Some(modal_proc), id);
+            DefSubclassProc(hwnd, message, w, l)
+        }
+        _ => DefSubclassProc(hwnd, message, w, l),
+    }
 }
 unsafe extern "system" fn navigation_proc(
     hwnd: HWND,
@@ -2289,11 +2909,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                         SCAN,
                         HIDE,
                         REMEMBER,
-                        ADVANCED,
-                        HISTORY,
-                        SETTINGS_START,
                         AUTOSTART,
-                        WIFI_AUTO,
                         REPAIR,
                         WEB_REPAIR,
                         BROWSER_FALLBACK,
@@ -2304,6 +2920,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                         TEST_BROWSER,
                         OPEN_LOGS,
                         CONNECTION_SETTINGS,
+                        ACCOUNT_SETTINGS,
+                        SAVE_SETTINGS,
                     ]
                     .contains(&id)
                     && w >> 16 != BN_CLICKED as usize
@@ -2312,15 +2930,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 }
                 match w & 0xffff {
                     START => app.dashboard_action(),
-                    SETTINGS_START => app.start_worker(false),
-                    ADVANCED => app.toggle_advanced(),
-                    HISTORY => app.toggle_history(),
                     OPEN_LOGS => app.open_log_folder(),
-                    CONNECTION_SETTINGS => {
-                        app.show_page(1);
-                        app.settings_scroll = app.px(270);
-                        app.update_settings_scroll();
-                    }
+                    CONNECTION_SETTINGS => app.show_interface_dialog(),
+                    ACCOUNT_SETTINGS => app.show_account_dialog(),
+                    SAVE_SETTINGS => app.save_general_settings(),
                     AUTOSTART => app.startup_changed(),
                     20..=22 if w >> 16 == EN_CHANGE as usize => app.update_start_title(),
                     STOP => app.stop_worker(),
@@ -2353,8 +2966,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                     }
                     SHOW => app.show(),
                     QUIT => app.quit(),
-                    WIFI_ADAPTER if w >> 16 == CBN_SELCHANGE as usize => app.show_wifi_option(),
-                    WIFI_AUTO => app.wifi_option_changed(),
                     REMEMBER => {
                         if SendMessageW(app.remember, BM_GETCHECK, 0, 0) != BST_CHECKED as isize {
                             if let Ok(path) = credential_path() {
@@ -2557,6 +3168,16 @@ pub fn run() {
             ..std::mem::zeroed()
         };
         RegisterClassW(&pane_class);
+        let modal_name = wide("BUAALoginModalWindow");
+        let modal_class = WNDCLASSW {
+            lpfnWndProc: Some(DefWindowProcW),
+            hInstance: instance,
+            lpszClassName: modal_name.as_ptr(),
+            hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+            hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
+            ..std::mem::zeroed()
+        };
+        RegisterClassW(&modal_class);
         let mut app = Box::new(App::new());
         let dpi = system_dpi();
         let style =
@@ -2600,11 +3221,11 @@ pub fn run() {
                 app.start_worker(false);
                 if app.handle.is_none() {
                     ShowWindow(window, SW_SHOW);
-                    app.show_page(1);
+                    app.show_account_dialog();
                 }
             } else {
                 ShowWindow(window, SW_SHOW);
-                app.show_page(1);
+                app.show_account_dialog();
                 app.record("开机自启：请保存完整账号、密码和连接配置后启用自动连接。");
             }
         } else {

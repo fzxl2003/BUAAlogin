@@ -315,7 +315,7 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         interfaceScroll.hasVerticalScroller = true; interfaceScroll.borderType = .bezelBorder
         interfaceList.frame = NSRect(x: 0, y: 0, width: 530, height: 236)
         interfaceScroll.documentView = interfaceList; panelContent.addSubview(interfaceScroll)
-        label("未勾选任何接口时自动选择；每个接口可单独设置网关与 Wi-Fi。", in: panelContent, 24, 314, 550, size: 12, secondary: true)
+        label("未勾选时自动选择；所有接口可设网关，仅 Wi-Fi 接口提供自动连接。", in: panelContent, 24, 314, 550, size: 12, secondary: true)
         label("默认网关地址", in: panelContent, 24, 350, 180, size: 13, weight: .semibold)
         place(gateway, in: panelContent, 24, 378, 240, 28)
         label("仅用于没有单独设置网关的接口", in: panelContent, 280, 382, 280, size: 12, secondary: true)
@@ -422,6 +422,7 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         if let source = source { CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes) }
     }
     private func rebuildInterfaceRows() {
+        interfaceRecords = classifiedInterfaceRecords(interfaceRecords)
         interfaceList.subviews.forEach { $0.removeFromSuperview() }; interfaceRows = []
         if interfaceRecords.isEmpty {
             let empty = NSTextField(labelWithString: "尚未检测接口，请点击右上角“检测校园网”。")
@@ -432,7 +433,8 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         interfaceList.setFrameSize(NSSize(width: 530, height: height))
         for (index, record) in interfaceRecords.enumerated() {
             let binding = record["binding"] as? String ?? ""
-            let title = "\(record["label"] as? String ?? binding) · \(record["message"] as? String ?? "")"
+            let kind = record["interface_kind"] as? String == "wifi" ? "Wi-Fi" : "有线"
+            let title = "\(kind) · \(record["label"] as? String ?? binding) · \(record["message"] as? String ?? "")"
             let row = NSButton(checkboxWithTitle: title, target: self, action: #selector(interfaceSelectionChanged(_:)))
             row.identifier = NSUserInterfaceItemIdentifier(binding); row.state = selectedBindings.contains(binding) ? .on : .off
             row.frame = NSRect(x: 12, y: CGFloat(index * 48 + 8), width: 402, height: 28)
@@ -441,6 +443,32 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
             details.bezelStyle = .rounded; details.controlSize = .small; details.tag = index
             details.frame = NSRect(x: 430, y: CGFloat(index * 48 + 7), width: 78, height: 28)
             interfaceList.addSubview(details)
+        }
+    }
+    private func classifiedInterfaceRecords(_ records: [[String: Any]]) -> [[String: Any]] {
+        let wifiNames = Set(wifi.interfaceNames())
+        var output = records.map { record -> [String: Any] in
+            var record = record
+            let name = record["name"] as? String ?? record["binding"] as? String ?? ""
+            record["interface_kind"] = wifiNames.contains(name) ? "wifi" : "wired"
+            return record
+        }
+        let existing = Set(output.compactMap { $0["name"] as? String })
+        for name in wifiNames.subtracting(existing).sorted() {
+            output.append([
+                "name": name,
+                "binding": name,
+                "label": name,
+                "message": "未获取 IP，可配置自动连接",
+                "campus": false,
+                "interface_kind": "wifi"
+            ])
+        }
+        return output.sorted { lhs, rhs in
+            let leftKind = lhs["interface_kind"] as? String ?? "wired"
+            let rightKind = rhs["interface_kind"] as? String ?? "wired"
+            if leftKind != rightKind { return leftKind == "wifi" }
+            return (lhs["name"] as? String ?? "") < (rhs["name"] as? String ?? "")
         }
     }
     @objc private func interfaceSelectionChanged(_ sender: NSButton) {
@@ -468,7 +496,7 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         wifiFree.state = targets.contains("BUAA-WiFi-Free") ? .on : .off
         let custom = targets.first { $0 != "BUAA-WiFi" && $0 != "BUAA-WiFi-Free" } ?? ""
         wifiCustomEnabled.state = custom.isEmpty ? .off : .on; wifiCustomName.stringValue = custom
-        let isWiFi = wifi.interfaceNames().contains(name)
+        let isWiFi = record["interface_kind"] as? String == "wifi"
         let height: CGFloat = isWiFi ? 350 : 230
         let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 500, height: height), styleMask: [.titled], backing: .buffered, defer: false)
         panel.title = "接口详情 · \(name)"; panel.isReleasedWhenClosed = false
@@ -505,7 +533,7 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
             guard gatewayValue.withCString({ inet_pton(AF_INET, $0, &address) }) == 1 else { alert("网关必须是 IPv4 地址"); return }
             interfaceGateways[binding] = gatewayValue
         } else { interfaceGateways.removeValue(forKey: binding) }
-        if wifi.interfaceNames().contains(name) {
+        if interfaceRecords.first(where: { ($0["binding"] as? String) == binding })?["interface_kind"] as? String == "wifi" {
             var targets = Set<String>()
             if wifiDefault.state == .on { targets.insert("BUAA-WiFi") }
             if wifiFree.state == .on { targets.insert("BUAA-WiFi-Free") }
@@ -873,7 +901,7 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         }
         if !monitoring && (state != "stopped" || !scanning) { updateState(state) }
         if state == "interfaces", let records = event["records"] as? [[String: Any]] {
-            interfaceRecords = records; rebuildInterfaceRows()
+            interfaceRecords = classifiedInterfaceRecords(records); rebuildInterfaceRows()
         }
         if state == "stopped" {
             let wasScanning = scanning; scanning = false

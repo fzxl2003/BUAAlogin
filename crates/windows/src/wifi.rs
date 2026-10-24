@@ -18,11 +18,11 @@ use windows_sys::{
         UI::WindowsAndMessaging::PostMessageW,
     },
 };
-const SSID: &[u8] = b"BUAA-WiFi";
 #[derive(Clone)]
 pub struct Adapter {
     pub id: String,
     pub name: String,
+    pub binding: String,
     guid: GUID,
 }
 fn id(g: &GUID) -> String {
@@ -37,8 +37,71 @@ fn id(g: &GUID) -> String {
             .collect::<String>()
     )
 }
+fn system_id(g: &GUID) -> String {
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{}",
+        g.data1,
+        g.data2,
+        g.data3,
+        g.data4[0],
+        g.data4[1],
+        g.data4[2..]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    )
+}
 fn string(chars: &[u16]) -> String {
     String::from_utf16_lossy(&chars[..chars.iter().position(|c| *c == 0).unwrap_or(chars.len())])
+}
+fn ip_adapter_bindings() -> HashMap<String, String> {
+    use windows_sys::Win32::{NetworkManagement::IpHelper::*, Networking::WinSock::AF_UNSPEC};
+    unsafe {
+        let mut size = 16_384u32;
+        loop {
+            let mut buffer = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
+            let head = buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
+            let result = GetAdaptersAddresses(
+                AF_UNSPEC as u32,
+                GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                null(),
+                head,
+                &mut size,
+            );
+            if result == 111 {
+                continue;
+            }
+            if result != 0 {
+                return HashMap::new();
+            }
+            let mut output = HashMap::new();
+            let mut current = head;
+            while !current.is_null() {
+                let adapter = &*current;
+                let mut key_len = 0;
+                while *adapter.AdapterName.add(key_len) != 0 {
+                    key_len += 1;
+                }
+                let key = String::from_utf8_lossy(std::slice::from_raw_parts(
+                    adapter.AdapterName,
+                    key_len,
+                ))
+                .trim_matches(['{', '}'])
+                .to_lowercase();
+                let mut name_len = 0;
+                while *adapter.FriendlyName.add(name_len) != 0 {
+                    name_len += 1;
+                }
+                let name = String::from_utf16_lossy(std::slice::from_raw_parts(
+                    adapter.FriendlyName,
+                    name_len,
+                ));
+                output.insert(key, name);
+                current = adapter.Next;
+            }
+            return output;
+        }
+    }
 }
 struct Memory<T>(*mut T);
 impl<T> Drop for Memory<T> {
@@ -70,6 +133,7 @@ impl Native {
     }
     fn adapters(&self) -> Result<Vec<Adapter>, String> {
         unsafe {
+            let bindings = ip_adapter_bindings();
             let mut list = null_mut();
             if WlanEnumInterfaces(self.handle, null(), &mut list) != 0 {
                 return Err("无法枚举 Wi-Fi 网卡".into());
@@ -84,6 +148,10 @@ impl Native {
                 .map(|i| Adapter {
                     id: id(&i.InterfaceGuid),
                     name: string(&i.strInterfaceDescription),
+                    binding: bindings
+                        .get(&system_id(&i.InterfaceGuid))
+                        .cloned()
+                        .unwrap_or_else(|| string(&i.strInterfaceDescription)),
                     guid: i.InterfaceGuid,
                 })
                 .collect())
@@ -120,7 +188,7 @@ impl Native {
             Ok(())
         }
     }
-    fn connected(&self, guid: &GUID) -> bool {
+    fn connected(&self, guid: &GUID, targets: &HashSet<String>) -> bool {
         unsafe {
             let mut size = 0;
             let mut data = null_mut();
@@ -142,25 +210,26 @@ impl Native {
             }
             let current = &*(data as *const WLAN_CONNECTION_ATTRIBUTES);
             let ssid = &current.wlanAssociationAttributes.dot11Ssid;
+            let length = ssid.uSSIDLength as usize;
             current.isState == wlan_interface_state_connected
-                && ssid.uSSIDLength as usize == SSID.len()
-                && &ssid.ucSSID[..SSID.len()] == SSID
+                && targets
+                    .iter()
+                    .any(|target| target.as_bytes() == &ssid.ucSSID[..length])
         }
     }
     fn scan(&self, guid: &GUID) -> Result<(), String> {
         unsafe {
-            let mut target = DOT11_SSID {
-                uSSIDLength: SSID.len() as u32,
-                ..DOT11_SSID::default()
-            };
-            target.ucSSID[..SSID.len()].copy_from_slice(SSID);
-            if WlanScan(self.handle, guid, &target, null(), null()) != 0 {
+            if WlanScan(self.handle, guid, null(), null(), null()) != 0 {
                 return Err("Wi-Fi 扫描失败，请检查无线开关和系统定位权限".into());
             }
             Ok(())
         }
     }
-    fn target(&self, guid: &GUID) -> Result<Option<WLAN_AVAILABLE_NETWORK>, String> {
+    fn target(
+        &self,
+        guid: &GUID,
+        targets: &HashSet<String>,
+    ) -> Result<Option<WLAN_AVAILABLE_NETWORK>, String> {
         unsafe {
             let mut list = null_mut();
             let result = WlanGetAvailableNetworkList(self.handle, guid, 0, null(), &mut list);
@@ -180,8 +249,10 @@ impl Native {
             Ok(rows
                 .iter()
                 .filter(|n| {
-                    n.dot11Ssid.uSSIDLength as usize == SSID.len()
-                        && &n.dot11Ssid.ucSSID[..SSID.len()] == SSID
+                    let length = n.dot11Ssid.uSSIDLength as usize;
+                    targets
+                        .iter()
+                        .any(|target| target.as_bytes() == &n.dot11Ssid.ucSSID[..length])
                         && n.bNetworkConnectable != 0
                         && n.dot11BssType == dot11_BSS_type_infrastructure
                 })
@@ -191,12 +262,14 @@ impl Native {
     }
     fn connect(&self, guid: &GUID, network: &WLAN_AVAILABLE_NETWORK) -> Result<(), String> {
         unsafe {
+            let length = network.dot11Ssid.uSSIDLength as usize;
+            let ssid_name = String::from_utf8_lossy(&network.dot11Ssid.ucSSID[..length]);
             let has_profile = network.dwFlags & WLAN_AVAILABLE_NETWORK_HAS_PROFILE != 0
                 && network.strProfileName[0] != 0;
             if network.bSecurityEnabled != 0 && !has_profile {
-                return Err(
-                    "BUAA-WiFi 需要无线凭据，请先在系统中连接；校园网密码不会用于 Wi-Fi".into(),
-                );
+                return Err(format!(
+                    "{ssid_name} 需要无线凭据，请先在系统中连接；校园网密码不会用于 Wi-Fi"
+                ));
             }
             let mut ssid = network.dot11Ssid;
             let params = WLAN_CONNECTION_PARAMETERS {
@@ -216,7 +289,9 @@ impl Native {
                 dwFlags: 0,
             };
             if WlanConnect(self.handle, guid, &params, null()) != 0 {
-                return Err("无法连接 BUAA-WiFi，请检查无线开关和系统网络配置".into());
+                return Err(format!(
+                    "无法连接 {ssid_name}，请检查无线开关和系统网络配置"
+                ));
             }
             Ok(())
         }
@@ -252,15 +327,21 @@ enum Action {
     Quit,
 }
 struct State {
-    enabled: Mutex<HashSet<String>>,
+    networks: Mutex<HashMap<String, HashSet<String>>>,
     active: AtomicBool,
     sleeping: AtomicBool,
 }
 impl State {
-    fn allows(&self, id: &str) -> bool {
-        self.active.load(Ordering::SeqCst)
-            && !self.sleeping.load(Ordering::SeqCst)
-            && self.enabled.lock().unwrap().contains(id)
+    fn targets(&self, id: &str) -> Option<HashSet<String>> {
+        if !self.active.load(Ordering::SeqCst) || self.sleeping.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.networks
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .filter(|targets| !targets.is_empty())
     }
 }
 pub struct Wifi {
@@ -274,7 +355,7 @@ impl Wifi {
         let (tx, rx) = mpsc::channel();
         let (out, messages) = mpsc::channel();
         let state = Arc::new(State {
-            enabled: Mutex::new(HashSet::new()),
+            networks: Mutex::new(HashMap::new()),
             active: AtomicBool::new(false),
             sleeping: AtomicBool::new(false),
         });
@@ -305,7 +386,7 @@ impl Wifi {
                     scans.clear();
                     continue;
                 }
-                if worker_state.enabled.lock().unwrap().is_empty() {
+                if worker_state.networks.lock().unwrap().is_empty() {
                     native = None;
                     attempts.clear();
                     scans.clear();
@@ -335,7 +416,10 @@ impl Wifi {
                     }
                 };
                 for adapter in rows {
-                    if !worker_state.allows(&adapter.id) || n.connected(&adapter.guid) {
+                    let Some(targets) = worker_state.targets(&adapter.id) else {
+                        continue;
+                    };
+                    if n.connected(&adapter.guid, &targets) {
                         continue;
                     }
                     let active_scan = match &action {
@@ -347,8 +431,8 @@ impl Wifi {
                                     .is_some_and(|t| t.elapsed() < Duration::from_secs(30))
                                 {
                                     emit(format!(
-                                        "{}：BUAA-WiFi 自动连接失败，等待后续扫描结果",
-                                        adapter.name
+                                        "{}：Wi-Fi 自动连接失败，等待后续扫描结果",
+                                        adapter.name,
                                     ));
                                 }
                                 continue;
@@ -390,15 +474,17 @@ impl Wifi {
                     {
                         continue;
                     }
-                    match n.target(&adapter.guid) {
-                        Ok(Some(network)) if worker_state.allows(&adapter.id) => {
+                    match n.target(&adapter.guid, &targets) {
+                        Ok(Some(network)) if worker_state.targets(&adapter.id).is_some() => {
                             attempts.insert(adapter.id.clone(), Instant::now());
+                            let length = network.dot11Ssid.uSSIDLength as usize;
+                            let ssid = String::from_utf8_lossy(&network.dot11Ssid.ucSSID[..length]);
                             match n.connect(&adapter.guid, &network) {
                                 Ok(()) => {
                                     last_error.clear();
                                     emit(format!(
-                                        "{}：发现 BUAA-WiFi，已请求自动连接",
-                                        adapter.name
+                                        "{}：发现 {}，已请求自动连接",
+                                        adapter.name, ssid
                                     ));
                                 }
                                 Err(e) => {
@@ -427,8 +513,8 @@ impl Wifi {
             worker: Some(worker),
         }
     }
-    pub fn configure(&self, enabled: HashSet<String>, active: bool) {
-        *self.state.enabled.lock().unwrap() = enabled;
+    pub fn configure(&self, networks: HashMap<String, HashSet<String>>, active: bool) {
+        *self.state.networks.lock().unwrap() = networks;
         self.state.active.store(active, Ordering::SeqCst);
         let _ = self.tx.send(Action::Refresh);
     }
