@@ -4,11 +4,11 @@ Cargo workspace 的 `buaa-core` 提供认证、HTTP、接口发现、调度和 C
 
 ## 会话与网络
 
-每个接口按名称、IPv4、系统接口索引唯一标识，拥有独立 libcurl easy handle、内存 Cookie、页面 IP/ac_id、连接缓存、检查截止时间和失败次数。认证状态由 `rad_user_info` 获取，外网状态由独立 easy handle 并发探测两个 HTTPS 站点；任一 2xx 通过，重定向不通过。外网通过时不因认证查询失败而注销。断线后重新读取页面和 challenge；网关页面返回的 IP 是校园网可见地址，与 challenge 和状态返回的 IP 校验一致；它可以与本地接口地址不同（路由器 NAT），提交成功后再次检查认证记录及外网。
+每个接口按名称、IPv4、系统接口索引唯一标识，拥有独立 libcurl easy handle、内存 Cookie、页面 IP/ac_id、连接缓存、检查截止时间。认证状态由 `rad_user_info` 获取，外网状态由独立 easy handle 并发探测两个 HTTPS 站点；任一 2xx 通过，重定向不通过。外网通过时不因认证查询失败而注销。断线后重新读取页面和 challenge；网关页面返回的 IP 是校园网可见地址，与 challenge 和状态返回的 IP 校验一致；它可以与本地接口地址不同（路由器 NAT），提交成功后再次检查认证记录及外网。
 
 认证请求固定为 `https://gw.buaa.edu.cn:443`，通过 resolve 将域名指向配置中的网关 IPv4。外网 HEAD 仅访问代码中固定的百度、腾讯 HTTPS 站点，不携带门户 Cookie。源地址由 libcurl interface 绑定；socket 创建时额外设置 macOS IP_BOUND_IF 或 Windows/Linux IP_UNICAST_IF。接口绑定失败直接报错，不退回系统默认路由。禁用代理和 TCP keepalive，不关闭证书校验。限制响应体为 1 MiB，认证请求不接受其他域名、端口或 HTTP 跳转。
 
-三轮外网失败之间至少间隔 10 秒；共享校园网出口的多个接口不会使轮数加速。恢复按协议注销、等待 2 秒、清 Cookie 后强制登录、外网验证、网页操作、外网验证执行。协议重登绕过 online 快速路径。`RecoveryBook` 位于接口 Slot 之外，以网关和校园网 IP 标识出口，开始恢复前预留 600 秒冷却；接口刷新不清除冷却。账号限制等结构化 `NeedsUser` 错误停止升级，网关原始描述不进入日志。
+三轮外网失败之间至少间隔所设检查周期；共享校园网出口的多个接口不会使轮数加速。恢复按协议注销、等待 2 秒、清 Cookie 后强制登录、外网验证、网页操作、外网验证执行。协议重登绕过 online 快速路径。`RecoveryBook` 位于接口 Slot 之外，以网关和校园网 IP 标识出口，在同一检查周期内对恢复去重，并在恢复结束时记录完成时间；接口刷新不清除记录，周期修改同时影响去重窗口。账号限制等结构化 `NeedsUser` 错误停止升级，网关原始描述不进入日志。
 
 网页恢复复用本机 Chrome/Edge/Chromium，以临时 profile 和仅本机随机调试端口启动。Rust 通过 CDP 读取主页面控件、发送 Input 事件，确认字段焦点和点击目标；支持确认弹窗，歧义、验证码或跨源页面明确失败。临时 CONNECT 代理只允许网关域名 443 端口，上游复用相同的 socket 接口绑定和配置网关 IP，不终止 TLS。浏览器禁用代理绕过、QUIC、非代理 WebRTC 和背景网络功能。临时浏览器目录、代理、调试连接、Unix 进程组/Windows Job Object 均随作用域清理，取消 generation 与 90 秒预算覆盖网页恢复及后续验证。
 
@@ -20,9 +20,9 @@ Srun xencode 遵循 JavaScript UTF-16 code units，HMAC/SHA1 使用 UTF-8。BMP 
 
 监控线程串行执行请求，同一接口不会重入。网络事件在接收时增加取消 generation，再合并 2 秒；请求的 libcurl progress callback 检测 generation 并中止传输，空闲等待由命令通道立即唤醒。取消依赖 libcurl 的 progress 调用，在活跃请求中通常有约一秒延迟，不等待完整 15 秒超时。
 
-macOS 监控线程阻塞等待命令，由 UI 收到 schedule 事件后设置一个单次 GCD timer，普通在线检查允许 min(5, interval / 10) 秒 leeway，最小周期 10 秒时仅允许 1 秒合并窗口，重试和网络去抖为 0。Windows/Linux 使用单次通道截止时间等待，不创建周期轮询。桌面 suspend 取消请求并丢弃会话／截止时间，resume 合并触发一次刷新。无候选接口时不安排重试，只等待网络通知或停止命令。
+macOS 监控线程阻塞等待命令，由 UI 收到 schedule 事件后设置一个单次 GCD timer，成功与失败均使用同一配置周期，timer leeway 为 0。Windows/Linux 使用单次通道截止时间等待，不创建周期轮询。桌面 suspend 取消请求并丢弃会话／截止时间，resume 合并触发一次刷新。无候选接口时不安排重试，只等待网络通知或停止命令。
 
-每个接口按 30、60、120、240、300 秒退避，成功清零，恢复配置周期。重试事件携带下一次重试的时间戳，桌面显示本地时间；每次失败更新一次，不刷新倒计时。每个接口分别抑制重复在线状态日志；桌面历史最多 120 行。Rust 保存的密码使用 Zeroizing，停止释放监控配置。GUI／系统库的内部字符串缓冲区无法承诺完全清零。
+每个接口在一轮操作完成后统一等待配置周期，认证、外网检测、异常复核与恢复失败均使用相同的下一次截止时间；不递增退避，也没有单独的恢复冷却周期。恢复步骤完成后验证一次外网，验证失败进入下一检查周期。重试事件携带下一次重试的时间戳，桌面显示本地时间；每次失败更新一次，不刷新倒计时。每个接口分别抑制重复在线状态日志；桌面历史最多 120 行。Rust 保存的密码使用 Zeroizing，停止释放监控配置。GUI／系统库的内部字符串缓冲区无法承诺完全清零。
 
 ## C ABI v1
 
@@ -31,7 +31,8 @@ macOS 监控线程阻塞等待命令，由 UI 收到 schedule 事件后设置一
 - create 接受仅在调用期间借用的 UTF-8 NUL 结尾 JSON、回调和上下文；失败返回 null。配置字段对应 Rust Config：username、password、interface（可省略）、gateway_ip、interval、try_all、external_timer、portal_auth_enabled、connectivity_probe_enabled、browser_fallback、browser_path。两个新增任务开关缺失时默认开启；browser_path 缺失时自动发现浏览器。
 - `buaa_test(client, kind)` 中 kind=0/1/2 分别执行认证、外网和网页真实测试；监控运行时排入串行命令队列，空闲时启动一次性任务。
 - start/scan 返回 0 表示启动成功，负数表示无效句柄、任务仍运行、配置或启动失败、内部 panic。一个句柄同时只能执行一个任务。
-- `buaa_recover(client, mode)` 增量扩展 ABI v1：mode=0 请求完整协议恢复链，mode=1 直接请求网页兜底；返回 0 表示已排队，-1 为无效句柄，-2 为任务未运行，-3 为无效 mode，-4 为内部异常。恢复在监控线程串行执行、合并重复待处理请求，且保留出口冷却。
+- `buaa_set_interval(client, seconds)`：10–86400 秒整数；返回 0 表示设置已保存并已排队更新运行中的监控，-1 为无效句柄，-2 为监控已停止，-3 为无效周期，-4 为内部异常。命令不取消正在进行的认证，完成后统一重设下一次截止时间；无活动任务时更新后续启动配置。
+- `buaa_recover(client, mode)` 增量扩展 ABI v1：mode=0 请求完整协议恢复链，mode=1 直接请求网页兜底；返回 0 表示已排队，-1 为无效句柄，-2 为任务未运行，-3 为无效 mode，-4 为内部异常。恢复在监控线程串行执行、合并重复待处理请求，且保留出口周期去重记录。
 - 句柄由创建它的主线程串行调用；不得并发 start/free 或重复 free。NULL 句柄可用于通知／free 空操作。callback 在工作线程调用，JSON 指针只在回调期间有效，调用者应先复制再切换主线程。
 - 事件包含 state、message、可选 records、可选 delay、可选 retry_at、可选 dashboard 和 leeway。schedule 中 delay 缺失意味着取消定时器；interfaces 返回含 name/address/index/binding/label/campus/campus_ip/message 的列表。
 - callback 不可 unwind，不可在工作线程内部调用 free。所有 ABI 入口捕获 Rust panic；回调和上下文需存活到 free 返回。free 取消并 join 工作线程，返回后不会再产生回调。

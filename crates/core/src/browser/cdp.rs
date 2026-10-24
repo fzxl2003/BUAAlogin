@@ -20,13 +20,18 @@ impl Cdp {
         let stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))
             .map_err(|_| "无法连接后台浏览器")?;
         stream
-            .set_read_timeout(Some(Duration::from_millis(100)))
+            .set_read_timeout(Some(Duration::from_secs(2)))
             .map_err(|_| "调试连接配置失败")?;
         stream
             .set_write_timeout(Some(Duration::from_secs(1)))
             .map_err(|_| "调试连接配置失败")?;
-        let (socket, _) = tungstenite::client(format!("ws://{address}{path}"), stream)
+        let (mut socket, _) = tungstenite::client(format!("ws://{address}{path}"), stream)
             .map_err(|_| "后台浏览器握手失败")?;
+        cancel.check()?;
+        socket
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .map_err(|_| "调试连接配置失败")?;
         Ok(Self {
             socket,
             next_id: 0,
@@ -67,6 +72,15 @@ impl Cdp {
                             return Err(AuthError::needs_user(
                                 "认证页面需要处理：请检查账号、密码、余额或验证码",
                             ));
+                        }
+                        if value["params"]["type"] != "confirm"
+                            || !["注销", "退出登录", "下线", "logout", "log out", "sign out"]
+                                .iter()
+                                .any(|part| message.to_lowercase().contains(part))
+                        {
+                            return Err(
+                                "认证页面出现提示，未确认登录成功；请在门户查看详细信息".into()
+                            );
                         }
                         self.next_id += 1;
                         self.socket.send(Message::Text(json!({"id":self.next_id,"method":"Page.handleJavaScriptDialog","params":{"accept":true}}).to_string().into())).map_err(|_| "认证确认弹窗处理失败")?;
@@ -133,6 +147,13 @@ impl Cdp {
             json!({"type":"keyUp","key":"a","code":"KeyA"}),
         )?;
         self.call("Input.insertText", json!({"text":text}))?;
+        let filled = self.evaluate(&format!(
+            "document.activeElement === window.__buaaControls?.[{}] && document.activeElement.value === {}",
+            json!(control), json!(text)
+        ))?;
+        if filled != true {
+            return Err("认证输入框填写失败".into());
+        }
         Ok(())
     }
 }

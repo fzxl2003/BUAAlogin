@@ -36,6 +36,12 @@ impl Cancellation {
             Ok(())
         }
     }
+    pub fn remaining(&self) -> Result<Option<Duration>, String> {
+        self.check()?;
+        Ok(self
+            .deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now())))
+    }
     pub fn wait(&self, duration: Duration) -> Result<(), String> {
         let end = Instant::now() + duration;
         loop {

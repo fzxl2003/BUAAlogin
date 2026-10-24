@@ -1,0 +1,9 @@
+<!doctype html><meta charset="utf-8"><title>Portal with a deferred login handler</title>
+<input id="username" autocomplete="username">
+<input id="password" type="password">
+<button id="login-account" type="button">登录</button>
+<script>
+window.fixtureSubmitted = false;
+window.jQuery = {_data: element => ({click: element.onclick ? [element.onclick] : []})};
+</script>
+<script src="/login-handler.js"></script>

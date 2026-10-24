@@ -250,6 +250,7 @@ pub struct Session {
     acid: Option<String>,
     generation: Arc<AtomicU64>,
     active_generation: u64,
+    request_deadline: Option<crate::cancellation::Cancellation>,
     #[cfg(test)]
     script: Option<std::collections::VecDeque<(String, Option<Url>)>>,
     #[cfg(test)]
@@ -294,6 +295,7 @@ impl Session {
             acid: None,
             active_generation: generation.load(Ordering::SeqCst),
             generation,
+            request_deadline: None,
             #[cfg(test)]
             script: None,
             #[cfg(test)]
@@ -305,6 +307,17 @@ impl Session {
         if self.generation.load(Ordering::SeqCst) != self.active_generation {
             return Err("已取消".into());
         }
+        let timeout = match &self.request_deadline {
+            Some(cancel) => cancel.remaining()?.unwrap_or(Duration::from_secs(15)),
+            None => Duration::from_secs(15),
+        };
+        self.easy
+            .timeout(
+                timeout
+                    .min(Duration::from_secs(15))
+                    .max(Duration::from_millis(1)),
+            )
+            .map_err(|_| "无法配置请求超时")?;
         #[cfg(test)]
         {
             self.requests.push(url.clone());
@@ -338,6 +351,15 @@ impl Session {
             String::from_utf8(bytes).map_err(|_| "网关编码错误")?,
             redirect,
         ))
+    }
+    pub(crate) fn refreshed_online(
+        &mut self,
+        cancel: &crate::cancellation::Cancellation,
+    ) -> Result<bool, String> {
+        let previous = self.request_deadline.replace(cancel.clone());
+        let result = self.inspect().and_then(|_| self.online());
+        self.request_deadline = previous;
+        result
     }
     fn api(&mut self, path: &str, params: &[(&str, &str)]) -> Result<Value, String> {
         let mut url = Url::parse(BASE).unwrap().join(path).unwrap();
@@ -567,6 +589,14 @@ mod tests {
         assert!(!s.login("test", "password").unwrap());
         assert_eq!(s.requests.len(), 6);
         assert_eq!(s.requests[5].path(), "/cgi-bin/rad_user_info");
+    }
+    #[test]
+    fn expired_browser_status_check_does_not_send_requests() {
+        let mut session = fixture(&[]);
+        let cancel = session.cancellation().with_timeout(Duration::ZERO);
+        assert_eq!(session.refreshed_online(&cancel).unwrap_err(), "操作超时");
+        assert!(session.requests.is_empty());
+        assert!(session.request_deadline.is_none());
     }
     #[test]
     fn modern_meta_redirect_and_router_nat() {

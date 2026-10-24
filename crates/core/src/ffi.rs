@@ -163,6 +163,34 @@ pub unsafe extern "C" fn buaa_test(client: *mut Client, kind: u32) -> i32 {
 }
 /// # Safety
 /// The client must be live (or null), used serially by its owning thread.
+/// A live monitor applies the new interval after its current operation completes.
+#[no_mangle]
+pub unsafe extern "C" fn buaa_set_interval(client: *mut Client, seconds: u64) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(client) = client.as_mut() else {
+            return -1;
+        };
+        if !(10..=86400).contains(&seconds) {
+            return -3;
+        }
+        if let Some(handle) = client
+            .handle
+            .as_ref()
+            .filter(|handle| !handle.is_finished())
+        {
+            if matches!(client.mode, Some(Mode::Monitor))
+                && handle.signal.set_interval(seconds).is_err()
+            {
+                return -2;
+            }
+        }
+        client.config.interval = seconds;
+        0
+    }))
+    .unwrap_or(-4)
+}
+/// # Safety
+/// The client must be live (or null), used serially by its owning thread.
 /// Callback context must remain valid until free returns; callbacks cannot unwind.
 #[no_mangle]
 pub unsafe extern "C" fn buaa_network_changed(client: *mut Client) {
@@ -243,8 +271,54 @@ mod tests {
             assert_eq!(buaa_start(std::ptr::null_mut()), -1);
             assert_eq!(buaa_recover(std::ptr::null_mut(), 0), -1);
             assert_eq!(buaa_test(std::ptr::null_mut(), 0), -1);
+            assert_eq!(buaa_set_interval(std::ptr::null_mut(), 10), -1);
             buaa_stop(std::ptr::null_mut());
             buaa_free(std::ptr::null_mut());
+        }
+    }
+    #[test]
+    fn interval_validation_and_live_updates_preserve_the_new_value_on_stop() {
+        unsafe extern "C" fn receive_json(context: *mut c_void, json: *const c_char) {
+            let tx = &*(context as *const std::sync::mpsc::Sender<serde_json::Value>);
+            let event = serde_json::from_slice(CStr::from_ptr(json).to_bytes()).unwrap();
+            let _ = tx.send(event);
+        }
+        unsafe {
+            let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+            let context = Box::into_raw(Box::new(tx));
+            let json = c"{\"username\":\"test\",\"password\":\"test\",\"interface\":\"nonexistent-test-interface\",\"external_timer\":true}";
+            let client = buaa_create(json.as_ptr(), Some(receive_json), context as _);
+            assert!(!client.is_null());
+            for invalid in [0, 9, 86401, u64::MAX] {
+                assert_eq!(buaa_set_interval(client, invalid), -3);
+                assert_eq!((*client).config.interval, 300);
+            }
+            assert_eq!(buaa_set_interval(client, 10), 0);
+            assert_eq!(buaa_start(client), 0);
+            assert_eq!(buaa_set_interval(client, 37), 0);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut updated = false;
+            loop {
+                let event = rx
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap();
+                if event["state"] == "dashboard" && event["dashboard"]["interval"] == 37 {
+                    updated = true;
+                }
+                if event["state"] == "interval_changed" {
+                    break;
+                }
+            }
+            buaa_free(client);
+            let events: Vec<_> = rx.try_iter().collect();
+            drop(Box::from_raw(context));
+            assert!(updated);
+            let stopped = events
+                .iter()
+                .find(|event| event["state"] == "dashboard")
+                .unwrap();
+            assert_eq!(stopped["dashboard"]["interval"], 37);
+            assert!(rx.recv().is_err());
         }
     }
     #[test]

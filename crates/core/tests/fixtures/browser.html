@@ -1,16 +1,81 @@
 <!doctype html><meta charset="utf-8"><title>Local portal fixture</title>
-<button id="logout">注销</button><main id="form"></main>
+<main id="status"></main><main id="form"></main>
 <script>
-window.fixtureResult = {logout:false,login:false,trusted:false};
-document.querySelector('#logout').onclick = event => {
-  fixtureResult.logout = event.isTrusted;
-  if (!confirm('确认注销？')) return;
-  event.target.remove();
-  document.querySelector('#form').innerHTML = '<label>账号<input id="username" autocomplete="username"></label><label>密码<input id="password" type="password"></label><button id="login">登录</button>';
-  document.querySelector('#login').onclick = loginEvent => {
-    fixtureResult.login = document.querySelector('#username').value === 'fixture-user' && document.querySelector('#password').value === 'fixture-password';
-    fixtureResult.trusted = loginEvent.isTrusted;
-    if (fixtureResult.login) document.querySelector('#form').innerHTML = '<button id="logout">注销</button>';
+const scenario = location.hash.slice(1);
+const needsLogout = scenario !== 'login';
+window.fixtureResult = {logout:false,logoutComplete:false,logoutClicks:0,login:false,trusted:false,earlyInput:false,order:[]};
+const result = window.fixtureResult;
+const form = document.querySelector('#form');
+const status = document.querySelector('#status');
+function showError(message) {
+  const dialog = document.createElement('div');
+  dialog.className = 'component confirm active';
+  dialog.innerHTML = '<div class="section"></div><button class="btn-confirm">确定</button>';
+  dialog.querySelector('.section').textContent = message;
+  dialog.querySelector('button').onclick = () => { result.errorDismissed = true; dialog.remove(); };
+  document.body.appendChild(dialog);
+}
+function showLogin() {
+  form.innerHTML = '<label>账号<input id="username" autocomplete="username"></label><label>密码<input id="password" type="password"></label><button id="login-account">登录</button>';
+  for (const input of form.querySelectorAll('input')) {
+    input.oninput = () => { if (needsLogout && !result.logoutComplete) result.earlyInput = true; };
+  }
+  document.querySelector('#login-account').onclick = event => {
+    result.order.push('login');
+    result.login = document.querySelector('#username').value === 'fixture-user' && document.querySelector('#password').value === 'fixture-password';
+    result.trusted = event.isTrusted;
+    if (needsLogout && !result.logoutComplete) { result.earlyInput = true; return; }
+    if (!result.login || scenario === 'silent') return;
+    if (scenario === 'rejected') { showError('E2531：密码错误'); return; }
+    const online = () => {
+      result.order.push('online');
+      form.innerHTML = '';
+      status.innerHTML = '<button id="logout">注销</button>';
+    };
+    if (scenario === 'delayed') setTimeout(online, 6000);
+    else online();
   };
-};
+}
+if (!needsLogout) {
+  showLogin();
+} else {
+  status.innerHTML = '<button id="logout">注销</button>';
+  if (scenario === 'mixed' || scenario === 'logout-stuck') showLogin();
+  if (scenario === 'mixed') {
+    // Login initialization can lag behind logout initialization on the same page.
+    window.jQuery = {_data: element => ({click: element.onclick && (element.id === 'logout' || result.logoutComplete) ? [element.onclick] : []})};
+  }
+  document.querySelector('#logout').onclick = event => {
+    result.logout = event.isTrusted;
+    result.logoutClicks += 1;
+    result.order.push('logout');
+    const loggedOut = () => {
+      result.order.push('confirm');
+      event.target.disabled = true;
+      if (scenario === 'logout-rejected') { showError('注销失败，请稍后重试'); return; }
+      if (scenario === 'logout-stuck') return;
+      const complete = () => {
+        result.logoutComplete = true;
+        result.order.push('logged_out');
+        event.target.remove();
+        showLogin();
+      };
+      if (scenario === 'mixed') setTimeout(complete, 800);
+      else complete();
+    };
+    if (!scenario) {
+      if (confirm('确认注销？')) loggedOut();
+      return;
+    }
+    const dialog = document.createElement('div');
+    dialog.className = 'component confirm active';
+    dialog.innerHTML = '<div class="section">您确定要注销吗？</div><button class="btn-confirm">确定</button><button class="btn-cancel">取消</button>';
+    dialog.querySelector('.btn-confirm').onclick = confirmEvent => {
+      if (!confirmEvent.isTrusted) return;
+      dialog.remove();
+      loggedOut();
+    };
+    document.body.appendChild(dialog);
+  };
+}
 </script>

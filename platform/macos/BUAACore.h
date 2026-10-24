@@ -10,6 +10,7 @@ int32_t buaa_scan(BuaaClient *client);
 void buaa_stop(BuaaClient *client);
 int32_t buaa_recover(BuaaClient *client, uint32_t mode);
 int32_t buaa_test(BuaaClient *client, uint32_t kind);
+int32_t buaa_set_interval(BuaaClient *client, uint64_t seconds);
 void buaa_network_changed(BuaaClient *client);
 void buaa_network_changed_interface(BuaaClient *client, const char *name);
 void buaa_suspend(BuaaClient *client);

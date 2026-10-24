@@ -68,6 +68,7 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
     private var wifiEnabled = Set<String>()
     private var wifiPanel: NSPanel?
     private var connectionPanel: NSPanel?
+    private var intervalPanel: NSPanel?
     private var wifiRows: [NSButton] = []
     private var monitoring = false
     private var closing = false
@@ -79,6 +80,9 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
     private let username = NSTextField(string: "")
     private let password = NSSecureTextField(string: "")
     private let interval = NSTextField(string: "300")
+    private var checkInterval: UInt64 = 300
+    private let intervalSettings = NSButton(title: "设置", target: nil, action: nil)
+    private let intervalError = NSTextField(labelWithString: "")
     private let gateway = NSTextField(string: "10.200.21.4")
     private let interfaces = NSPopUpButton(frame: .zero, pullsDown: false)
     private let remember = NSButton(checkboxWithTitle: "记住账号密码（系统钥匙串）", target: nil, action: nil)
@@ -183,6 +187,10 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
             place(value, in: overview, x, y + 19, 190, 24); dashboardValues.append(value)
         }
         dashboardValues[0].frame.size.width = 94
+        intervalSettings.bezelStyle = .rounded; intervalSettings.controlSize = .small
+        intervalSettings.target = self; intervalSettings.action = #selector(showIntervalSettings)
+        intervalSettings.setAccessibilityLabel("设置检查周期")
+        place(intervalSettings, in: overview, 266, 139, 60, 24)
         updateState("idle")
         let connectionSettings = NSButton(title: "连接设置…", target: self, action: #selector(showConnectionSettings))
         connectionSettings.bezelStyle = .rounded; connectionSettings.controlSize = .small
@@ -250,10 +258,7 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         interfaces.addItem(withTitle: "自动选择"); interfaces.setAccessibilityLabel("校园网接口")
         place(interfaces, in: settingsForm, 12, 432, 380, 32)
         detect.bezelStyle = .rounded; place(detect, in: settingsForm, 408, 432, 160, 32)
-        label("检查间隔", in: settingsForm, 16, 482, 550)
-        configureField(interval, "检查间隔（秒）", "10–86400"); interval.delegate = self
-        place(interval, in: settingsForm, 16, 508, 100, 28)
-        label("秒 · 最低 10 秒，失败时采用递增退避", in: settingsForm, 132, 513, 434, size: 12, secondary: true)
+        configureField(interval, "检查周期（秒）", "10–86400"); interval.delegate = self
         advancedButton.setButtonType(.pushOnPushOff); advancedButton.bezelStyle = .disclosure
         advancedButton.target = self; advancedButton.action = #selector(toggleAdvanced)
         advancedButton.setAccessibilityLabel("展开或收起高级选项")
@@ -274,21 +279,18 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         configureField(browserPath, "后台浏览器可执行文件", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
         place(browserPath, in: advancedSection, 0, 236, 550, 30)
         advancedSection.isHidden = true
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 600, height: 540), styleMask: [.titled], backing: .buffered, defer: false)
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 600, height: 492), styleMask: [.titled], backing: .buffered, defer: false)
         panel.title = "连接设置"; panel.isReleasedWhenClosed = false
-        let panelContent = FlippedContent(frame: NSRect(x: 0, y: 0, width: 600, height: 540)); panel.contentView = panelContent
+        let panelContent = FlippedContent(frame: NSRect(x: 0, y: 0, width: 600, height: 492)); panel.contentView = panelContent
         label("校园网接口", in: panelContent, 24, 20, 540)
         interfaces.removeFromSuperview(); place(interfaces, in: panelContent, 20, 46, 370, 32)
         detect.removeFromSuperview(); place(detect, in: panelContent, 404, 46, 170, 32)
-        label("检查间隔", in: panelContent, 24, 96, 150)
-        interval.removeFromSuperview(); place(interval, in: panelContent, 130, 92, 100, 28)
-        label("秒 · 认证和外网检测共用", in: panelContent, 244, 97, 330, size: 12, secondary: true)
-        advancedButton.removeFromSuperview(); place(advancedButton, in: panelContent, 24, 144, 18, 18)
-        label("高级选项", in: panelContent, 50, 142, 500)
-        advancedSection.removeFromSuperview(); place(advancedSection, in: panelContent, 24, 178, 550, 310)
+        advancedButton.removeFromSuperview(); place(advancedButton, in: panelContent, 24, 96, 18, 18)
+        label("高级选项", in: panelContent, 50, 94, 500)
+        advancedSection.removeFromSuperview(); place(advancedSection, in: panelContent, 24, 130, 550, 310)
         let doneConnection = NSButton(title: "完成", target: self, action: #selector(closeConnectionSettings))
         doneConnection.bezelStyle = .rounded; doneConnection.keyEquivalent = "\r"
-        place(doneConnection, in: panelContent, 474, 498, 100, 30)
+        place(doneConnection, in: panelContent, 474, 450, 100, 30)
         connectionPanel = panel
         settingsForm.setFrameSize(NSSize(width: 596, height: 350))
         settingsHint.font = .systemFont(ofSize: 12); settingsHint.textColor = .secondaryLabelColor
@@ -312,7 +314,7 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         }
         editItem.submenu = editMenu; main.addItem(editItem); NSApp.mainMenu = main
         if let settings = UserDefaults.standard.dictionary(forKey: settingsKey) {
-            interval.stringValue = settings["interval"] as? String ?? "300"
+            if let seconds = UInt64(settings["interval"] as? String ?? "300"), (10...86400).contains(seconds) { checkInterval = seconds }
             gateway.stringValue = settings["gateway"] as? String ?? "10.200.21.4"
             browserFallback.state = (settings["browser_fallback"] as? Bool ?? true) ? .on : .off
             portalAuth.state = (settings["portal_auth_enabled"] as? Bool ?? true) ? .on : .off
@@ -405,6 +407,43 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
     }
     @objc private func showConnectionSettings() { if let panel = connectionPanel { window.beginSheet(panel) } }
     @objc private func closeConnectionSettings() { if let panel = connectionPanel { window.endSheet(panel); panel.orderOut(nil) } }
+    @objc private func showIntervalSettings() {
+        guard intervalPanel == nil, window.attachedSheet == nil else { return }
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 420, height: 190), styleMask: [.titled], backing: .buffered, defer: false)
+        panel.title = "设置检查周期"; panel.isReleasedWhenClosed = false
+        let content = FlippedContent(frame: NSRect(x: 0, y: 0, width: 420, height: 190)); panel.contentView = content
+        let hint = NSTextField(wrappingLabelWithString: "所有自动检查和失败重试共用此周期，最小 10 秒。")
+        hint.font = .systemFont(ofSize: 13); hint.frame = NSRect(x: 24, y: 20, width: 372, height: 38); content.addSubview(hint)
+        interval.stringValue = String(checkInterval)
+        interval.frame = NSRect(x: 24, y: 70, width: 130, height: 28); content.addSubview(interval)
+        let unit = NSTextField(labelWithString: "秒"); unit.frame = NSRect(x: 166, y: 74, width: 60, height: 22); content.addSubview(unit)
+        intervalError.stringValue = ""; intervalError.textColor = .systemRed; intervalError.font = .systemFont(ofSize: 12)
+        intervalError.frame = NSRect(x: 24, y: 106, width: 372, height: 22); content.addSubview(intervalError)
+        let cancel = NSButton(title: "取消", target: self, action: #selector(closeIntervalSettings))
+        cancel.bezelStyle = .rounded; cancel.keyEquivalent = "\u{1b}"
+        cancel.frame = NSRect(x: 208, y: 142, width: 88, height: 30); content.addSubview(cancel)
+        let save = NSButton(title: "保存", target: self, action: #selector(saveIntervalSettings))
+        save.bezelStyle = .rounded; save.keyEquivalent = "\r"
+        save.frame = NSRect(x: 306, y: 142, width: 88, height: 30); content.addSubview(save)
+        intervalPanel = panel; window.beginSheet(panel); panel.makeFirstResponder(interval); interval.selectText(nil)
+    }
+    @objc private func closeIntervalSettings() {
+        if let panel = intervalPanel { window.endSheet(panel); panel.orderOut(nil) }; intervalPanel = nil
+    }
+    @objc private func saveIntervalSettings() {
+        guard let seconds = UInt64(interval.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)), (10...86400).contains(seconds) else {
+            intervalError.stringValue = "请输入 10–86400 之间的整数秒数。"
+            intervalPanel?.makeFirstResponder(interval); interval.selectText(nil); return
+        }
+        if let client = client, buaa_set_interval(client, seconds) != 0 {
+            intervalError.stringValue = "保存失败，请稍后重试。"; return
+        }
+        checkInterval = seconds
+        var settings = UserDefaults.standard.dictionary(forKey: settingsKey) ?? [:]
+        settings["interval"] = String(seconds); UserDefaults.standard.set(settings, forKey: settingsKey)
+        updateStartTitle(); closeIntervalSettings()
+        if !monitoring { record("检查周期已设置为 \(seconds) 秒") }
+    }
     @objc private func selectPage() {
         showPage(navigation.selectedSegment)
     }
@@ -417,11 +456,11 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
     private var completeConfiguration: Bool {
         var address = in_addr()
         return !username.stringValue.trimmingCharacters(in: .whitespaces).isEmpty && !password.stringValue.isEmpty
-            && UInt64(interval.stringValue).map({ (10...86400).contains($0) }) == true
+            && (10...86400).contains(checkInterval)
             && gateway.stringValue.trimmingCharacters(in: .whitespaces).withCString({ inet_pton(AF_INET, $0, &address) }) == 1
     }
     private func saveConnectionPreferences() {
-        var settings: [String: Any] = ["interval": interval.stringValue, "gateway": gateway.stringValue.trimmingCharacters(in: .whitespaces), "browser_fallback": browserFallback.state == .on, "portal_auth_enabled": portalAuth.state == .on, "connectivity_probe_enabled": connectivityProbe.state == .on, "browser_path": browserPath.stringValue.trimmingCharacters(in: .whitespaces)]
+        var settings: [String: Any] = ["interval": String(checkInterval), "gateway": gateway.stringValue.trimmingCharacters(in: .whitespaces), "browser_fallback": browserFallback.state == .on, "portal_auth_enabled": portalAuth.state == .on, "connectivity_probe_enabled": connectivityProbe.state == .on, "browser_path": browserPath.stringValue.trimmingCharacters(in: .whitespaces)]
         if let binding = selectionBindings[interfaces.indexOfSelectedItem] { settings["interface"] = binding }
         UserDefaults.standard.set(settings, forKey: settingsKey)
     }
@@ -461,7 +500,7 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         let credentialsRequired = portalAuth.state == .on || browserFallback.state == .on
         let configured = !credentialsRequired || (!username.stringValue.trimmingCharacters(in: .whitespaces).isEmpty && !password.stringValue.isEmpty)
         start.title = monitoring ? "停止自动连接" : (configured ? "开始自动连接" : "设置账号")
-        dashboardValues[4].stringValue = "\(interval.stringValue) 秒"
+        dashboardValues[4].stringValue = "\(checkInterval) 秒"
     }
     @objc private func toggleAdvanced() {
         let expanded = advancedButton.state == .on
@@ -470,7 +509,8 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         if connectionPanel == nil { settingsForm.setFrameSize(NSSize(width: 596, height: expanded ? 922 : 582)) }
     }
     private func focusSetting(_ field: NSTextField) {
-        if field === gateway || field === interval || field === browserPath {
+        if field === interval { showIntervalSettings(); return }
+        if field === gateway || field === browserPath {
             if field === gateway || field === browserPath { advancedButton.state = .on; toggleAdvanced() }
             showConnectionSettings(); window.makeFirstResponder(field); field.selectText(nil); return
         }
@@ -501,7 +541,7 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         dashboardValues[1].stringValue = snapshot["local_ip"] as? String ?? "—"
         dashboardValues[2].stringValue = snapshot["campus_ip"] as? String ?? "—"
         dashboardValues[3].stringValue = localTime(snapshot["last_check_at"])
-        dashboardValues[4].stringValue = "\(snapshot["interval"] as? UInt64 ?? 300) 秒"
+        dashboardValues[4].stringValue = "\(checkInterval) 秒"
         let auth = ["unknown": "未知", "offline": "未认证", "online": "已认证"][snapshot["authentication"] as? String ?? "unknown"] ?? "未知"
         let internet = ["unknown": "未知", "available": "可用", "unavailable": "不可用"][snapshot["connectivity"] as? String ?? "unknown"] ?? "未知"
         let authColor: NSColor = auth == "已认证" ? .systemGreen : (auth == "未认证" ? .systemOrange : .secondaryLabelColor)
@@ -561,7 +601,7 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
     }
     private func createClient(_ scan: Bool, requireCredentials: Bool = true) -> Bool {
         guard client == nil else { return false }
-        guard let seconds = UInt64(interval.stringValue), (10...86400).contains(seconds) else { focusSetting(interval); alert("检查间隔须在 10–86400 秒之间"); return false }
+        let seconds = checkInterval
         if !scan && requireCredentials && (username.stringValue.trimmingCharacters(in: .whitespaces).isEmpty || password.stringValue.isEmpty) { focusSetting(username.stringValue.trimmingCharacters(in: .whitespaces).isEmpty ? username : password); alert("请输入账号和密码"); return false }
         var address = in_addr()
         guard gateway.stringValue.trimmingCharacters(in: .whitespaces).withCString({ inet_pton(AF_INET, $0, &address) }) == 1 else {
@@ -581,7 +621,7 @@ private final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegat
         return true
     }
     private func setBusy(_ busy: Bool) {
-        [username, password, interval, gateway, browserPath].forEach { $0.isEnabled = !busy }
+        [username, password, gateway, browserPath].forEach { $0.isEnabled = !busy }
         portalAuth.isEnabled = !busy; connectivityProbe.isEnabled = !busy
         browserFallback.isEnabled = !busy && connectivityProbe.state == .on
         interfaces.isEnabled = !busy; remember.isEnabled = !busy; start.isEnabled = !scanning && testing == nil; detect.isEnabled = !busy
