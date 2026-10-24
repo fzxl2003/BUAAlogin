@@ -1,0 +1,16 @@
+<!doctype html><meta charset="utf-8"><title>Local portal fixture</title>
+<button id="logout">注销</button><main id="form"></main>
+<script>
+window.fixtureResult = {logout:false,login:false,trusted:false};
+document.querySelector('#logout').onclick = event => {
+  fixtureResult.logout = event.isTrusted;
+  if (!confirm('确认注销？')) return;
+  event.target.remove();
+  document.querySelector('#form').innerHTML = '<label>账号<input id="username" autocomplete="username"></label><label>密码<input id="password" type="password"></label><button id="login">登录</button>';
+  document.querySelector('#login').onclick = loginEvent => {
+    fixtureResult.login = document.querySelector('#username').value === 'fixture-user' && document.querySelector('#password').value === 'fixture-password';
+    fixtureResult.trusted = loginEvent.isTrusted;
+    if (fixtureResult.login) document.querySelector('#form').innerHTML = '<button id="logout">注销</button>';
+  };
+};
+</script>

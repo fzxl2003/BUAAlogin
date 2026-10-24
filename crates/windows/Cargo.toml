@@ -4,6 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-buaa-core = { path = "../core" }
+buaa-core = { path = "../core", features = ["browser-fallback"] }
 serde_json.workspace = true
 windows-sys = { workspace = true, features = ["Win32_UI_Accessibility"] }

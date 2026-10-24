@@ -35,60 +35,216 @@ impl Handler for Transfer {
         socktype: i32,
         protocol: i32,
     ) -> Option<curl_sys::curl_socket_t> {
-        let socket =
-            socket2::Socket::new(family.into(), socktype.into(), Some(protocol.into())).ok()?;
-        // Source address binding alone can follow the wrong default route.
-        // Pin the outbound interface as well, and fail closed if unsupported.
-        #[cfg(unix)]
+        bound_socket(family, socktype, protocol, self.index)
+            .ok()
+            .map(|socket| {
+                #[cfg(unix)]
+                {
+                    use std::os::fd::IntoRawFd;
+                    socket.into_raw_fd()
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::io::IntoRawSocket;
+                    socket.into_raw_socket() as _
+                }
+            })
+    }
+}
+
+pub(crate) fn bound_socket(
+    family: i32,
+    socktype: i32,
+    protocol: i32,
+    index: u32,
+) -> Result<socket2::Socket, String> {
+    let socket = socket2::Socket::new(family.into(), socktype.into(), Some(protocol.into()))
+        .map_err(|_| "无法创建网络 socket")?;
+    // Source address binding alone can follow the wrong default route.
+    // Pin the outbound interface as well, and fail closed if unsupported.
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        #[cfg(target_os = "macos")]
+        let (option, value) = (libc::IP_BOUND_IF, index);
+        #[cfg(target_os = "linux")]
+        let (option, value) = (libc::IP_UNICAST_IF, index.to_be());
+        if unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_IP,
+                option,
+                &value as *const _ as *const _,
+                std::mem::size_of_val(&value) as _,
+            )
+        } != 0
         {
-            use std::os::fd::{AsRawFd, IntoRawFd};
-            #[cfg(target_os = "macos")]
-            let (option, value) = (libc::IP_BOUND_IF, self.index);
-            #[cfg(target_os = "linux")]
-            let (option, value) = (libc::IP_UNICAST_IF, self.index.to_be());
-            if unsafe {
-                libc::setsockopt(
-                    socket.as_raw_fd(),
-                    libc::IPPROTO_IP,
-                    option,
-                    &value as *const _ as *const _,
-                    std::mem::size_of_val(&value) as _,
-                )
-            } != 0
-            {
-                return None;
-            }
-            Some(socket.into_raw_fd())
+            return Err("无法绑定所选网络接口".into());
         }
-        #[cfg(windows)]
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{setsockopt, IPPROTO_IP, IP_UNICAST_IF};
+        let value = index.to_be();
+        if unsafe {
+            setsockopt(
+                socket.as_raw_socket() as _,
+                IPPROTO_IP,
+                IP_UNICAST_IF,
+                &value as *const _ as _,
+                4,
+            )
+        } != 0
         {
-            use std::os::windows::io::{AsRawSocket, IntoRawSocket};
-            use windows_sys::Win32::Networking::WinSock::{setsockopt, IPPROTO_IP, IP_UNICAST_IF};
-            let value = self.index.to_be();
-            if unsafe {
-                setsockopt(
-                    socket.as_raw_socket() as _,
-                    IPPROTO_IP,
-                    IP_UNICAST_IF,
-                    &value as *const _ as _,
-                    4,
-                )
-            } != 0
-            {
-                return None;
-            }
-            Some(socket.into_raw_socket() as _)
+            return Err("无法绑定所选网络接口".into());
         }
+    }
+    Ok(socket)
+}
+
+pub(crate) fn probe_head(
+    interface: &Interface,
+    cancel: &crate::cancellation::Cancellation,
+    url: &str,
+) -> crate::connectivity::ProbeOutcome {
+    use crate::connectivity::ProbeOutcome;
+    if cancel.check().is_err() {
+        return ProbeOutcome::Cancelled;
+    }
+    let Ok(mut session) = Session::new(
+        interface.clone(),
+        &Config::default(),
+        cancel.generation.clone(),
+    ) else {
+        return ProbeOutcome::Transport;
+    };
+    session.easy.get_mut().active = cancel.active;
+    let setup = (|| -> Result<(), curl::Error> {
+        session.easy.url(url)?;
+        session.easy.nobody(true)?;
+        session.easy.connect_timeout(Duration::from_secs(3))?;
+        session.easy.timeout(Duration::from_secs(5))?;
+        Ok(())
+    })();
+    if setup.is_err() {
+        return ProbeOutcome::Transport;
+    }
+    let result = session.easy.perform();
+    if cancel.check().is_err() {
+        return ProbeOutcome::Cancelled;
+    }
+    match result {
+        Ok(()) => match session.easy.response_code() {
+            Ok(status) if (200..300).contains(&status) => ProbeOutcome::Available,
+            Ok(status) => ProbeOutcome::Http(status),
+            Err(_) => ProbeOutcome::Transport,
+        },
+        Err(e) if e.is_couldnt_resolve_host() => ProbeOutcome::Dns,
+        Err(e) if e.is_operation_timedout() => ProbeOutcome::Timeout,
+        Err(e) if e.is_ssl_connect_error() || e.is_ssl_cacert() || e.is_ssl_certproblem() => {
+            ProbeOutcome::Tls
+        }
+        Err(_) => ProbeOutcome::Transport,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthErrorKind {
+    Retryable,
+    NeedsUser,
+    Cancelled,
+}
+#[derive(Clone, Debug)]
+pub struct AuthError {
+    pub kind: AuthErrorKind,
+    message: String,
+}
+impl AuthError {
+    pub fn needs_user(message: &str) -> Self {
+        Self {
+            kind: AuthErrorKind::NeedsUser,
+            message: message.into(),
+        }
+    }
+    pub fn from_reply(reply: &Value) -> Option<Self> {
+        if reply["error"] == "ok" {
+            return None;
+        }
+        let code = reply["error"].as_str().unwrap_or("unknown");
+        let safe =
+            if code.len() <= 40 && code.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+                code
+            } else {
+                "unknown"
+            };
+        let description = ["error", "error_msg", "suc_msg", "message"]
+            .iter()
+            .filter_map(|k| reply[*k].as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        if code == "E2531"
+            || [
+                "password_error",
+                "password error",
+                "密码错误",
+                "账号禁用",
+                "帐号禁用",
+                "账号限制",
+                "account_disabled",
+                "account disabled",
+                "欠费",
+                "余额不足",
+                "balance_insufficient",
+                "captcha",
+                "验证码",
+            ]
+            .iter()
+            .any(|v| description.contains(v))
+        {
+            return Some(Self::needs_user(&format!(
+                "认证需要处理（{safe}）：请检查账号、密码、余额或验证码"
+            )));
+        }
+        Some(Self {
+            kind: AuthErrorKind::Retryable,
+            message: format!("认证失败：{safe}"),
+        })
+    }
+}
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for AuthError {}
+impl From<String> for AuthError {
+    fn from(message: String) -> Self {
+        Self {
+            kind: if message == "已取消" {
+                AuthErrorKind::Cancelled
+            } else {
+                AuthErrorKind::Retryable
+            },
+            message,
+        }
+    }
+}
+impl From<&str> for AuthError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
     }
 }
 
 pub trait Portal {
-    fn login(&mut self, username: &str, password: &str) -> Result<bool, String>;
+    fn login(&mut self, username: &str, password: &str) -> Result<bool, AuthError>;
     fn inspect(&mut self) -> Result<(), String>;
     fn online(&mut self) -> Result<bool, String>;
     fn campus_ip(&self) -> Option<&str>;
 }
 pub struct Session {
+    pub(crate) interface: Interface,
     easy: Easy2<Transfer>,
     ip: Option<String>,
     acid: Option<String>,
@@ -132,6 +288,7 @@ impl Session {
         })();
         setup.map_err(|_| "无法配置校园网请求")?;
         Ok(Self {
+            interface,
             easy,
             ip: None,
             acid: None,
@@ -196,6 +353,89 @@ impl Session {
             return Err("认证接口发生重定向".into());
         }
         protocol::parse_jsonp(&body)
+    }
+
+    pub(crate) fn cancellation(&self) -> crate::cancellation::Cancellation {
+        crate::cancellation::Cancellation::new(self.generation.clone(), self.active_generation)
+    }
+    pub fn force_login(&mut self, username: &str, password: &str) -> Result<bool, AuthError> {
+        // A fresh page/challenge is mandatory even when rad_user_info says online.
+        self.ip = None;
+        self.acid = None;
+        self.easy
+            .cookie_list("ALL")
+            .map_err(|_| "无法清除旧认证 Cookie")?;
+        self.inspect()?;
+        self.submit_login(username, password)
+    }
+    pub fn logout(&mut self, username: &str) -> Result<bool, AuthError> {
+        if self.ip.is_none() {
+            self.inspect()?;
+        }
+        let ip = self.ip.clone().unwrap();
+        let acid = self.acid.clone().unwrap();
+        let reply = self.api(
+            "/cgi-bin/srun_portal",
+            &[
+                ("action", "logout"),
+                ("username", username),
+                ("ip", &ip),
+                ("ac_id", &acid),
+                ("double_stack", "0"),
+            ],
+        )?;
+        if reply["error"] == "not_online_error" {
+            return Ok(false);
+        }
+        if let Some(error) = AuthError::from_reply(&reply) {
+            return Err(error);
+        }
+        Ok(true)
+    }
+    fn submit_login(&mut self, username: &str, password: &str) -> Result<bool, AuthError> {
+        let ip = self.ip.clone().unwrap();
+        let acid = self.acid.clone().unwrap();
+        let challenge = self.api(
+            "/cgi-bin/get_challenge",
+            &[("username", username), ("ip", &ip)],
+        )?;
+        if challenge["error"].as_str().is_some_and(|v| v != "ok") {
+            if let Some(error) = AuthError::from_reply(&challenge) {
+                return Err(error);
+            }
+        }
+        let token = challenge["challenge"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .ok_or("获取 challenge 失败")?;
+        if challenge["client_ip"].as_str().is_some_and(|v| v != ip) {
+            return Err("challenge IP 与网关报告的校园网 IP 不一致".into());
+        }
+        let fields = protocol::login_fields(username, password, &ip, &acid, token);
+        let reply = self.api(
+            "/cgi-bin/srun_portal",
+            &[
+                ("action", "login"),
+                ("username", username),
+                ("password", &fields.password),
+                ("ac_id", &acid),
+                ("ip", &ip),
+                ("info", &fields.info),
+                ("chksum", &fields.checksum),
+                ("n", "200"),
+                ("type", "1"),
+                ("double_stack", "0"),
+                ("os", std::env::consts::OS),
+                ("name", "BUAALogin"),
+            ],
+        )?;
+        if let Some(error) = AuthError::from_reply(&reply) {
+            return Err(error);
+        }
+        if !self.online()? {
+            return Err("网关接受认证，但未确认校园网 IP 在线".into());
+        }
+        Ok(true)
     }
     pub fn activate(&mut self) {
         self.active_generation = self.generation.load(Ordering::SeqCst);
@@ -271,7 +511,7 @@ impl Portal for Session {
     fn campus_ip(&self) -> Option<&str> {
         self.ip.as_deref()
     }
-    fn login(&mut self, username: &str, password: &str) -> Result<bool, String> {
+    fn login(&mut self, username: &str, password: &str) -> Result<bool, AuthError> {
         if self.ip.is_some() && self.online()? {
             return Ok(false);
         }
@@ -279,53 +519,7 @@ impl Portal for Session {
         if self.online()? {
             return Ok(false);
         }
-        let ip = self.ip.clone().unwrap();
-        let acid = self.acid.clone().unwrap();
-        let challenge = self.api(
-            "/cgi-bin/get_challenge",
-            &[("username", username), ("ip", &ip)],
-        )?;
-        let token = challenge["challenge"]
-            .as_str()
-            .filter(|v| !v.is_empty())
-            .ok_or("获取 challenge 失败")?;
-        if challenge["client_ip"].as_str().is_some_and(|v| v != ip) {
-            return Err("challenge IP 与网关报告的校园网 IP 不一致".into());
-        }
-        let fields = protocol::login_fields(username, password, &ip, &acid, token);
-        let reply = self.api(
-            "/cgi-bin/srun_portal",
-            &[
-                ("action", "login"),
-                ("username", username),
-                ("password", &fields.password),
-                ("ac_id", &acid),
-                ("ip", &ip),
-                ("info", &fields.info),
-                ("chksum", &fields.checksum),
-                ("n", "200"),
-                ("type", "1"),
-                ("double_stack", "0"),
-                ("os", std::env::consts::OS),
-                ("name", "BUAALogin"),
-            ],
-        )?;
-        if reply["error"] != "ok" {
-            // Gateway error messages can echo secrets; emit only a bounded error code.
-            let code = reply["error"].as_str().unwrap_or("unknown");
-            let safe = if code.len() <= 40
-                && code.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
-            {
-                code
-            } else {
-                "unknown"
-            };
-            return Err(format!("登录失败：{safe}"));
-        }
-        if !self.online()? {
-            return Err("网关接受认证，但未确认校园网 IP 在线".into());
-        }
-        Ok(true)
+        self.submit_login(username, password)
     }
 }
 #[cfg(test)]
@@ -396,7 +590,11 @@ mod tests {
             r#"{"error":"ok"}"#,
             r#"{"error":"ok","online_ip":"172.20.10.2"}"#,
         ]);
-        assert!(s.login("test", "password").unwrap_err().contains("未确认"));
+        assert!(s
+            .login("test", "password")
+            .unwrap_err()
+            .to_string()
+            .contains("未确认"));
     }
     #[test]
     fn cancelled_session_makes_no_followup_requests() {
@@ -413,7 +611,59 @@ mod tests {
             r#"{"error":"not_online_error"}"#,
             r#"{"challenge":"abc123","client_ip":"172.20.10.2"}"#,
         ]);
-        assert!(s.login("test", "password").unwrap_err().contains("不一致"));
+        assert!(s
+            .login("test", "password")
+            .unwrap_err()
+            .to_string()
+            .contains("不一致"));
         assert_eq!(s.requests.len(), 3);
+    }
+    #[test]
+    fn logout_and_force_login_refresh_ip_and_bypass_online_record() {
+        let mut session = fixture(&[
+            r#"var CONFIG = {acid: "78", ip: "10.1.2.3"};"#,
+            r#"{"error":"ok"}"#,
+            r#"var CONFIG = {acid: "79", ip: "10.1.2.4"};"#,
+            r#"{"challenge":"fresh","client_ip":"10.1.2.4"}"#,
+            r#"{"error":"ok"}"#,
+            r#"{"error":"ok","online_ip":"10.1.2.4"}"#,
+        ]);
+        session.inspect().unwrap();
+        assert!(session.logout("test").unwrap());
+        assert!(session.force_login("test", "password").unwrap());
+        assert_eq!(session.campus_ip(), Some("10.1.2.4"));
+        let logout: std::collections::HashMap<_, _> = session.requests[1].query_pairs().collect();
+        assert_eq!(logout.get("action").unwrap(), "logout");
+        let login: std::collections::HashMap<_, _> = session.requests[4].query_pairs().collect();
+        assert_eq!(login.get("action").unwrap(), "login");
+        assert_eq!(login.get("ac_id").unwrap(), "79");
+        assert_eq!(login.get("ip").unwrap(), "10.1.2.4");
+        assert_eq!(
+            session
+                .requests
+                .iter()
+                .filter(|url| url.path() == "/cgi-bin/rad_user_info")
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn authentication_restrictions_are_safe_and_stop_escalation() {
+        for reply in [
+            serde_json::json!({"error":"E2531", "error_msg":"password_error secret-password"}),
+            serde_json::json!({"error":"denied", "error_msg":"账号禁用 secret-user"}),
+            serde_json::json!({"error":"denied", "error_msg":"余额不足"}),
+            serde_json::json!({"error":"denied", "error_msg":"captcha required"}),
+        ] {
+            let error = AuthError::from_reply(&reply).unwrap();
+            assert_eq!(error.kind, AuthErrorKind::NeedsUser);
+            assert!(!error.to_string().contains("secret"));
+        }
+        assert_eq!(
+            AuthError::from_reply(&serde_json::json!({"error":"temporary_error"}))
+                .unwrap()
+                .kind,
+            AuthErrorKind::Retryable
+        );
     }
 }

@@ -25,6 +25,7 @@ fn run() -> Result<u8, String> {
         password: env::var("PASSWORD").unwrap_or_default().into(),
         interface: env::var("INTERFACE").ok().filter(|s| !s.is_empty()),
         try_all: true,
+        browser_fallback: false,
         ..Config::default()
     };
     let mut mode = Mode::Monitor;

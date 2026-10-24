@@ -1,12 +1,16 @@
 # 原生实现
 
-Cargo workspace 的 `buaa-core` 提供认证、HTTP、接口发现、调度和 C ABI；`buaalogin` 提供非交互 CLI；`buaalogin-windows` 是直接调用 Win32 的窗口／托盘程序。macOS 的 Swift/AppKit 入口静态链接 core，一个桌面进程内执行所有功能。
+Cargo workspace 的 `buaa-core` 提供认证、HTTP、接口发现、调度和 C ABI；`buaalogin` 提供非交互 CLI；`buaalogin-windows` 是直接调用 Win32 的窗口／托盘程序。macOS 的 Swift/AppKit 入口静态链接 core。桌面构建通过 `browser-fallback` feature 按需启动本机 Chromium 系浏览器；CLI/Docker 关闭该能力。
 
 ## 会话与网络
 
-每个接口按名称、IPv4、系统接口索引唯一标识，拥有独立 libcurl easy handle、内存 Cookie、页面 IP/ac_id、连接缓存、检查截止时间和失败次数。普通在线检查只调用 `rad_user_info`。断线后重新读取页面和 challenge；网关页面返回的 IP 是校园网可见地址，与 challenge 和状态返回的 IP 校验一致；它可以与本地接口地址不同（路由器 NAT），提交成功后再次检查状态。
+每个接口按名称、IPv4、系统接口索引唯一标识，拥有独立 libcurl easy handle、内存 Cookie、页面 IP/ac_id、连接缓存、检查截止时间和失败次数。认证状态由 `rad_user_info` 获取，外网状态由独立 easy handle 并发探测两个 HTTPS 站点；任一 2xx 通过，重定向不通过。外网通过时不因认证查询失败而注销。断线后重新读取页面和 challenge；网关页面返回的 IP 是校园网可见地址，与 challenge 和状态返回的 IP 校验一致；它可以与本地接口地址不同（路由器 NAT），提交成功后再次检查认证记录及外网。
 
-所有请求固定为 `https://gw.buaa.edu.cn:443`，通过 resolve 将域名指向配置中的网关 IPv4。源地址由 libcurl interface 绑定；socket 创建时额外设置 macOS IP_BOUND_IF 或 Windows/Linux IP_UNICAST_IF。接口绑定失败直接报错，不退回系统默认路由。禁用代理和 TCP keepalive，不关闭证书校验。限制响应体为 1 MiB，不接受其他域名、端口或 HTTP 跳转。
+认证请求固定为 `https://gw.buaa.edu.cn:443`，通过 resolve 将域名指向配置中的网关 IPv4。外网 HEAD 仅访问代码中固定的百度、腾讯 HTTPS 站点，不携带门户 Cookie。源地址由 libcurl interface 绑定；socket 创建时额外设置 macOS IP_BOUND_IF 或 Windows/Linux IP_UNICAST_IF。接口绑定失败直接报错，不退回系统默认路由。禁用代理和 TCP keepalive，不关闭证书校验。限制响应体为 1 MiB，认证请求不接受其他域名、端口或 HTTP 跳转。
+
+三轮外网失败之间至少间隔 10 秒；共享校园网出口的多个接口不会使轮数加速。恢复按协议注销、等待 2 秒、清 Cookie 后强制登录、外网验证、网页操作、外网验证执行。协议重登绕过 online 快速路径。`RecoveryBook` 位于接口 Slot 之外，以网关和校园网 IP 标识出口，开始恢复前预留 600 秒冷却；接口刷新不清除冷却。账号限制等结构化 `NeedsUser` 错误停止升级，网关原始描述不进入日志。
+
+网页恢复复用本机 Chrome/Edge/Chromium，以临时 profile 和仅本机随机调试端口启动。Rust 通过 CDP 读取主页面控件、发送 Input 事件，确认字段焦点和点击目标；支持确认弹窗，歧义、验证码或跨源页面明确失败。临时 CONNECT 代理只允许网关域名 443 端口，上游复用相同的 socket 接口绑定和配置网关 IP，不终止 TLS。浏览器禁用代理绕过、QUIC、非代理 WebRTC 和背景网络功能。临时浏览器目录、代理、调试连接、Unix 进程组/Windows Job Object 均随作用域清理，取消 generation 与 90 秒预算覆盖网页恢复及后续验证。
 
 macOS 和 Linux 通过 getifaddrs 获取接口快照（Linux libc 通过 rtnetlink 读取）；Windows 使用 GetAdaptersAddresses。仅启动、手动检测或网络通知后刷新快照。macOS 使用 SCDynamicStore，Windows 注册接口和单播地址变化，Linux 阻塞等待 rtnetlink 的 link/address/route 通知。接口通知仅重建受影响会话；无法确定接口的全局路由变化重建全部候选会话。桌面默认优先上次成功接口；Docker 每个接口独立调度。
 
@@ -24,8 +28,10 @@ macOS 监控线程阻塞等待命令，由 UI 收到 schedule 事件后设置一
 
 `platform/macos/BUAACore.h` 是接口定义：`buaa_abi_version`、`buaa_create`、`buaa_start`、`buaa_scan`、`buaa_stop`、网络变化／睡眠／恢复／tick 通知及 `buaa_free`。
 
-- create 接受仅在调用期间借用的 UTF-8 NUL 结尾 JSON、回调和上下文；失败返回 null。配置字段对应 Rust Config：username、password、interface（可省略）、gateway_ip、interval、try_all、external_timer。
+- create 接受仅在调用期间借用的 UTF-8 NUL 结尾 JSON、回调和上下文；失败返回 null。配置字段对应 Rust Config：username、password、interface（可省略）、gateway_ip、interval、try_all、external_timer、portal_auth_enabled、connectivity_probe_enabled、browser_fallback、browser_path。两个新增任务开关缺失时默认开启；browser_path 缺失时自动发现浏览器。
+- `buaa_test(client, kind)` 中 kind=0/1/2 分别执行认证、外网和网页真实测试；监控运行时排入串行命令队列，空闲时启动一次性任务。
 - start/scan 返回 0 表示启动成功，负数表示无效句柄、任务仍运行、配置或启动失败、内部 panic。一个句柄同时只能执行一个任务。
+- `buaa_recover(client, mode)` 增量扩展 ABI v1：mode=0 请求完整协议恢复链，mode=1 直接请求网页兜底；返回 0 表示已排队，-1 为无效句柄，-2 为任务未运行，-3 为无效 mode，-4 为内部异常。恢复在监控线程串行执行、合并重复待处理请求，且保留出口冷却。
 - 句柄由创建它的主线程串行调用；不得并发 start/free 或重复 free。NULL 句柄可用于通知／free 空操作。callback 在工作线程调用，JSON 指针只在回调期间有效，调用者应先复制再切换主线程。
 - 事件包含 state、message、可选 records、可选 delay、可选 retry_at、可选 dashboard 和 leeway。schedule 中 delay 缺失意味着取消定时器；interfaces 返回含 name/address/index/binding/label/campus/campus_ip/message 的列表。
 - callback 不可 unwind，不可在工作线程内部调用 free。所有 ABI 入口捕获 Rust panic；回调和上下文需存活到 free 返回。free 取消并 join 工作线程，返回后不会再产生回调。
@@ -33,13 +39,13 @@ macOS 监控线程阻塞等待命令，由 UI 收到 schedule 事件后设置一
 
 ## 原生界面
 
-macOS 使用 AppKit 系统字体、动态配色、SF Symbols、分段控件和原生 sheet；Windows 保留 Common Controls v6 标签页及标准输入控件，在 WM_PAINT 中绘制分段导航、浅色分组背景与状态符号，按钮使用原生 owner-draw。中文采用 Microsoft YaHei UI，三个共享字体分别为 14/15/24 逻辑像素。默认内容区域为 680 × 600，只有“连接仪表盘”和“设置”两页，Windows 按系统 DPI 缩放，Windows 11 圆角交给 DWM。仪表盘提供六项连接信息、最近五条活动和主要操作；完整记录在固定日志区域内展开，历史上限 120 条。
+macOS 使用 AppKit 系统字体、动态配色、SF Symbols、分段控件和原生 sheet；Windows 保留 Common Controls v6 标签页及标准输入控件。默认内容区域为 680 × 700，只有“连接”和“账号设置”两页。连接页提供单一开始／停止按钮、五项连接信息、带高对比状态圆点的三行任务状态和最近五条活动；完整记录按日写入系统用户日志目录并保留 30 天。
 
 Windows 输入框仍由原生 Edit 负责输入法、密码遮蔽和辅助技术；外框及焦点强调色由设置面板绘制。Tab 和方向键沿用原生控件交互；Enter 优先激活当前获焦的按钮，编辑字段中保留默认启动行为。按钮动作只接收 BN_CLICKED，焦点通知只用于滚入视口。系统高对比度启用时使用系统颜色，主题通知触发重绘。不加载 Shell 图标资源，程序与托盘图标在启动时用 GDI 生成一次；自建字体、图标及临时绘图对象均配对释放。
 
 设置表单使用独立原生滚动区域，按账号和连接分组，高级选项默认折叠。网关校验出错时展开高级选项、滚动并聚焦该字段。账号、连接字段在任务运行时锁定，Wi-Fi 开关保持原有即时生效行为。启动成功返回仪表盘；tab 切换、日志和高级选项展开不触发网络操作。
 
-`dashboard` 是只读事件，其 `dashboard` 快照包含 phase、interface、local_ip、campus_ip、last_check_at、retry_at、interval；未知信息为 null，时间戳为 Unix 秒。phase 使用 checking、online、retry、waiting_network、suspended、stopped。请求开始与结束更新快照，不解析日志文案；网络变化后保留未受影响的连接，接口消失、睡眠及停止清除当前地址与重试时间。展示用本地 HH:mm:ss，无倒计时刷新。活动事件与快照分开：稳定在线检查更新检查时间，但不重复打印在线日志；CLI 忽略 dashboard 事件。
+`dashboard` 是只读事件，其快照除原有连接字段外包含 `tasks.portal_auth`、`tasks.connectivity` 和 `tasks.browser_fallback`。每项任务提供 enabled、phase、message、last_run_at、next_run_at 与 schedule_reason；未知时间为 null。C ABI v1 通过新增的 `buaa_test(client, kind)` 兼容扩展支持认证、外网和网页三类真实测试。
 
 界面不使用网页视图、重绘定时器或循环动画；数据事件到来才更新。仪表盘隐藏时仅维护活动历史，返回后再渲染日志。
 

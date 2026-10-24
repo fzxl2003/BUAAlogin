@@ -1,7 +1,7 @@
 use crate::appearance::{self, Palette};
 use buaa_core::{
-    engine::{Handle, Mode},
-    Config, DashboardSnapshot, Event,
+    engine::{Handle, Mode, RecoveryMode, TestKind},
+    Config, DashboardSnapshot, Event, TaskScheduleReason,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -15,6 +15,7 @@ use windows_sys::Win32::{
     Security::Cryptography::*,
     System::{
         LibraryLoader::*,
+        SystemInformation::GetLocalTime,
         SystemServices::{SS_ENDELLIPSIS, SS_OWNERDRAW},
         Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
     },
@@ -35,6 +36,16 @@ const ADVANCED: usize = 33;
 const HISTORY: usize = 34;
 const SETTINGS_START: usize = 35;
 const AUTOSTART: usize = 36;
+const REPAIR: usize = 37;
+const WEB_REPAIR: usize = 38;
+const BROWSER_FALLBACK: usize = 39;
+const PORTAL_AUTH: usize = 41;
+const CONNECTIVITY_PROBE: usize = 42;
+const TEST_PORTAL: usize = 43;
+const TEST_CONNECTIVITY: usize = 44;
+const TEST_BROWSER: usize = 45;
+const OPEN_LOGS: usize = 46;
+const CONNECTION_SETTINGS: usize = 47;
 const START: usize = 10;
 const STOP: usize = 11;
 const SCAN: usize = 12;
@@ -56,6 +67,15 @@ struct App {
     remember: HWND,
     start: HWND,
     stop: HWND,
+    repair: HWND,
+    web_repair: HWND,
+    browser_fallback: HWND,
+    portal_auth: HWND,
+    connectivity_probe: HWND,
+    test_buttons: [HWND; 3],
+    task_results: [HWND; 3],
+    task_next: [HWND; 3],
+    browser_path: HWND,
     scan: HWND,
     status: HWND,
     history: HWND,
@@ -73,7 +93,7 @@ struct App {
     settings_hint: HWND,
     startup: HWND,
     history_button: HWND,
-    dashboard_values: [HWND; 6],
+    dashboard_values: [HWND; 5],
     state_title: HWND,
     state_icon: HWND,
     palette: Palette,
@@ -90,6 +110,7 @@ struct App {
     receiver: Option<Receiver<Event>>,
     closing: bool,
     scanning: bool,
+    testing: Option<TestKind>,
     tray: NOTIFYICONDATAW,
     font: HFONT,
     power: windows_sys::Win32::System::Power::HPOWERNOTIFY,
@@ -111,6 +132,15 @@ impl App {
             remember: null_mut(),
             start: null_mut(),
             stop: null_mut(),
+            repair: null_mut(),
+            web_repair: null_mut(),
+            browser_fallback: null_mut(),
+            portal_auth: null_mut(),
+            connectivity_probe: null_mut(),
+            test_buttons: [null_mut(); 3],
+            task_results: [null_mut(); 3],
+            task_next: [null_mut(); 3],
+            browser_path: null_mut(),
             scan: null_mut(),
             status: null_mut(),
             history: null_mut(),
@@ -128,7 +158,7 @@ impl App {
             settings_hint: null_mut(),
             startup: null_mut(),
             history_button: null_mut(),
-            dashboard_values: [null_mut(); 6],
+            dashboard_values: [null_mut(); 5],
             state_title: null_mut(),
             state_icon: null_mut(),
             palette: unsafe { Palette::system() },
@@ -145,6 +175,7 @@ impl App {
             receiver: None,
             closing: false,
             scanning: false,
+            testing: None,
             tray: unsafe { std::mem::zeroed() },
             font: null_mut(),
             power: 0,
@@ -453,9 +484,9 @@ impl App {
             let mut chars = [0u16; 256];
             let len = if tab {
                 let label = if item.itemID == 0 {
-                    "连接仪表盘"
+                    "连接"
                 } else {
-                    "设置"
+                    "账号设置"
                 };
                 let mut count = 0;
                 for ch in label.encode_utf16() {
@@ -490,7 +521,7 @@ impl App {
         appearance::fill(dc, &area, p.background);
         appearance::rounded(dc, &area, self.px(12), p.soft, p.soft);
         SetBkMode(dc, TRANSPARENT as i32);
-        for (index, title) in ["连接仪表盘", "设置"].iter().enumerate() {
+        for (index, title) in ["连接", "账号设置"].iter().enumerate() {
             let mut rect: RECT = std::mem::zeroed();
             SendMessageW(hwnd, TCM_GETITEMRECT, index, &mut rect as *mut _ as isize);
             let selected = index == self.active_page;
@@ -539,6 +570,7 @@ impl App {
         self.control("STATIC", text, 0, x, y, width, 22, 0)
     }
     unsafe fn build(&mut self) {
+        cleanup_logs();
         self.dpi = system_dpi();
         // Explicit UI family avoids the classic bitmap/serif fallback on Chinese Windows.
         // Three shared fonts, the same count as the previous UI.
@@ -583,7 +615,7 @@ impl App {
             ((self.px(32) as isize) << 16) | self.px(134) as isize,
         );
         SendMessageW(self.tabs, TCM_SETPADDING, 0, 0);
-        for (index, title) in ["连接仪表盘", "设置"].iter().enumerate() {
+        for (index, title) in ["连接", "账号设置"].iter().enumerate() {
             let mut title = wide(title);
             let item = TCITEMW {
                 mask: TCIF_TEXT,
@@ -611,7 +643,7 @@ impl App {
             self.px(32),
             self.px(80),
             self.px(616),
-            self.px(424),
+            self.px(524),
             self.window,
             null_mut(),
             GetModuleHandleW(null()),
@@ -624,7 +656,7 @@ impl App {
         SendMessageW(self.state_title, WM_SETFONT, self.title_font as usize, 1);
         self.status = self.control(
             "STATIC",
-            "先在设置中填写账号，再开始自动重连。",
+            "先在账号设置中填写凭据，再开始自动连接。",
             0,
             120,
             135,
@@ -633,22 +665,15 @@ impl App {
             0,
         );
         self.update_state("idle");
-        for (index, title) in [
-            "当前接口",
-            "本地 IP",
-            "校园网 IP",
-            "上次检查",
-            "检查周期",
-            "下次重试",
-        ]
-        .iter()
-        .enumerate()
+        for (index, title) in ["当前接口", "本地 IP", "校园网 IP", "上次检查", "检查周期"]
+            .iter()
+            .enumerate()
         {
-            let x = 52 + (index as i32 % 2) * 304;
-            let y = 201 + (index as i32 / 2) * 54;
-            self.label(title, x, y, 260);
+            let x = 32 + (index as i32 % 3) * 205;
+            let y = 174 + (index as i32 / 3) * 46;
+            self.label(title, x, y, 180);
             self.dashboard_values[index] =
-                self.control("STATIC", "—", SS_ENDELLIPSIS, x, y + 23, 260, 24, 0);
+                self.control("STATIC", "—", SS_ENDELLIPSIS, x, y + 20, 180, 24, 0);
             SendMessageW(
                 self.dashboard_values[index],
                 WM_SETFONT,
@@ -656,17 +681,97 @@ impl App {
                 1,
             );
         }
-        let recent = self.label("最近活动", 32, 373, 300);
+        SetWindowPos(
+            self.dashboard_values[0],
+            null_mut(),
+            0,
+            0,
+            self.px(84),
+            self.px(24),
+            SWP_NOMOVE | SWP_NOZORDER,
+        );
+        self.control(
+            "BUTTON",
+            "连接设置…",
+            WS_TABSTOP,
+            122,
+            193,
+            96,
+            27,
+            CONNECTION_SETTINGS,
+        );
+        self.portal_auth = self.control(
+            "BUTTON",
+            "校园网认证（普通连接）",
+            BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+            32,
+            290,
+            190,
+            25,
+            PORTAL_AUTH,
+        );
+        self.connectivity_probe = self.control(
+            "BUTTON",
+            "外网可用性检测",
+            BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+            32,
+            326,
+            190,
+            25,
+            CONNECTIVITY_PROBE,
+        );
+        self.browser_fallback = self.control(
+            "BUTTON",
+            "网页兜底",
+            BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+            32,
+            362,
+            190,
+            25,
+            BROWSER_FALLBACK,
+        );
+        for control in [
+            self.portal_auth,
+            self.connectivity_probe,
+            self.browser_fallback,
+        ] {
+            SendMessageW(control, BM_SETCHECK, BST_CHECKED as usize, 0);
+        }
+        for (index, y) in [290, 326, 362].iter().enumerate() {
+            self.task_results[index] =
+                self.control("STATIC", "尚未运行", SS_ENDELLIPSIS, 228, *y, 170, 24, 0);
+            self.task_next[index] = self.control(
+                "STATIC",
+                if index == 2 { "—" } else { "启动后立即" },
+                SS_ENDELLIPSIS,
+                402,
+                *y,
+                130,
+                24,
+                0,
+            );
+            self.test_buttons[index] = self.control(
+                "BUTTON",
+                "测试",
+                WS_TABSTOP,
+                548,
+                *y - 3,
+                68,
+                29,
+                TEST_PORTAL + index,
+            );
+        }
+        let recent = self.label("最近活动", 32, 402, 300);
         SendMessageW(recent, WM_SETFONT, self.heading_font as usize, 1);
         self.history_button = self.control(
             "BUTTON",
-            "查看完整记录",
+            "打开日志文件夹",
             WS_TABSTOP,
             492,
-            368,
+            397,
             156,
             30,
-            HISTORY,
+            OPEN_LOGS,
         );
         self.history = self.control(
             "EDIT",
@@ -677,24 +782,21 @@ impl App {
                 | WS_VSCROLL
                 | WS_TABSTOP,
             46,
-            415,
+            435,
             588,
-            74,
+            145,
             0,
         );
         self.start = self.control(
             "BUTTON",
             "设置账号",
             BS_DEFPUSHBUTTON as u32 | WS_TABSTOP,
-            32,
-            530,
-            184,
+            462,
+            630,
+            186,
             38,
             START,
         );
-        self.stop = self.control("BUTTON", "停止", WS_TABSTOP, 228, 530, 88, 38, STOP);
-        EnableWindow(self.stop, 0);
-        self.control("BUTTON", "收起至托盘", WS_TABSTOP, 492, 530, 156, 38, HIDE);
 
         self.building_page.set(Some(1));
         let title = self.label("账号与启动", 20, 14, 560);
@@ -842,6 +944,22 @@ impl App {
             24,
             WIFI_AUTO,
         );
+        self.label(
+            "浏览器可执行文件（留空自动查找 Chrome / Edge / Chromium）",
+            20,
+            628,
+            544,
+        );
+        self.browser_path = self.control(
+            "EDIT",
+            "",
+            WS_BORDER | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+            20,
+            658,
+            544,
+            30,
+            40,
+        );
         self.building_advanced.set(false);
         if let Ok(path) = wifi_path() {
             if let Ok(data) = std::fs::read(path) {
@@ -851,20 +969,6 @@ impl App {
         self.wifi = Some(crate::wifi::Wifi::new(self.window, WIFI_EVENTS));
         self.refresh_wifi_options();
         self.building_page.set(None);
-        self.settings_start = self.control(
-            "BUTTON",
-            "开始自动重连",
-            WS_TABSTOP,
-            462,
-            530,
-            186,
-            38,
-            SETTINGS_START,
-        );
-        self.settings_hint = self.label("开始时保存并应用设置。", 32, 539, 410);
-        self.page_controls
-            .borrow_mut()
-            .extend([(self.settings_start, 1), (self.settings_hint, 1)]);
         self.update_settings_scroll();
         self.show_page(0);
         self.tray.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -911,7 +1015,13 @@ impl App {
     }
     unsafe fn update_state(&self, state: &str) {
         let (title, kind) = match state {
-            "online" => ("校园网在线", 1),
+            "online" => ("网络正常", 1),
+            "suspect" => ("外网异常，正在复核", 2),
+            "protocol_recovery" => ("协议恢复中", 0),
+            "browser_recovery" => ("后台网页兜底中", 0),
+            "verifying" => ("正在验证外网", 0),
+            "cooldown" => ("恢复冷却中", 2),
+            "needs_user" => ("认证需要处理", 2),
             "retry" => ("等待自动重试", 2),
             "error" | "failed" => ("连接需要处理", 2),
             "suspended" => ("睡眠期间暂停", 3),
@@ -922,6 +1032,20 @@ impl App {
             _ => ("北航校园网", 0),
         };
         self.state_kind.set(kind);
+        let can_repair = self.handle.is_some()
+            && !self.scanning
+            && !matches!(
+                state,
+                "protocol_recovery"
+                    | "browser_recovery"
+                    | "verifying"
+                    | "cooldown"
+                    | "needs_user"
+                    | "suspended"
+                    | "waiting_network"
+                    | "stopped"
+            );
+        let _ = can_repair;
         SetWindowTextW(self.state_title, wide(title).as_ptr());
         InvalidateRect(self.state_icon, null(), 0);
     }
@@ -997,7 +1121,7 @@ impl App {
             cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
             fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
             nMin: 0,
-            nMax: self.px(if self.advanced_expanded { 594 } else { 424 }) - 1,
+            nMax: self.px(if self.advanced_expanded { 718 } else { 424 }) - 1,
             nPage: (area.bottom - area.top).max(0) as u32,
             nPos: self.settings_scroll,
             nTrackPos: 0,
@@ -1064,6 +1188,14 @@ impl App {
             password: text(self.password).into(),
             interval: text(self.interval).parse().ok()?,
             gateway_ip: text(self.gateway).trim().parse().ok()?,
+            portal_auth_enabled: SendMessageW(self.portal_auth, BM_GETCHECK, 0, 0)
+                == BST_CHECKED as isize,
+            connectivity_probe_enabled: SendMessageW(self.connectivity_probe, BM_GETCHECK, 0, 0)
+                == BST_CHECKED as isize,
+            browser_fallback: SendMessageW(self.browser_fallback, BM_GETCHECK, 0, 0)
+                == BST_CHECKED as isize,
+            browser_path: Some(text(self.browser_path).trim().to_owned())
+                .filter(|path| !path.is_empty()),
             interface: self
                 .bindings
                 .get(SendMessageW(self.interfaces, CB_GETCURSEL, 0, 0) as usize)
@@ -1130,12 +1262,17 @@ impl App {
         if self.start.is_null() {
             return;
         }
-        let configured = self.handle.is_some()
+        let credentials_required = SendMessageW(self.portal_auth, BM_GETCHECK, 0, 0)
+            == BST_CHECKED as isize
+            || SendMessageW(self.browser_fallback, BM_GETCHECK, 0, 0) == BST_CHECKED as isize;
+        let configured = !credentials_required
             || (!text(self.username).trim().is_empty() && !text(self.password).is_empty());
         SetWindowTextW(
             self.start,
-            wide(if configured {
-                "开始自动重连"
+            wide(if self.handle.is_some() && !self.scanning {
+                "停止自动连接"
+            } else if configured {
+                "开始自动连接"
             } else {
                 "设置账号"
             })
@@ -1149,7 +1286,16 @@ impl App {
         }
     }
     unsafe fn dashboard_action(&mut self) {
-        if text(self.username).trim().is_empty() || text(self.password).is_empty() {
+        if self.handle.is_some() && !self.scanning {
+            self.stop_worker();
+            return;
+        }
+        let credentials_required = SendMessageW(self.portal_auth, BM_GETCHECK, 0, 0)
+            == BST_CHECKED as isize
+            || SendMessageW(self.browser_fallback, BM_GETCHECK, 0, 0) == BST_CHECKED as isize;
+        if credentials_required
+            && (text(self.username).trim().is_empty() || text(self.password).is_empty())
+        {
             self.focus_setting(self.username);
         } else {
             self.start_worker(false);
@@ -1166,10 +1312,46 @@ impl App {
             snapshot.campus_ip.clone().unwrap_or_else(|| "—".into()),
             local_time(snapshot.last_check_at),
             format!("{} 秒", snapshot.interval),
-            local_time(snapshot.retry_at),
         ];
         for (control, value) in self.dashboard_values.iter().zip(values) {
             SetWindowTextW(*control, wide(&value).as_ptr());
+        }
+        if snapshot.phase != "stopped" {
+            for (index, task) in [
+                &snapshot.tasks.portal_auth,
+                &snapshot.tasks.connectivity,
+                &snapshot.tasks.browser_fallback,
+            ]
+            .iter()
+            .enumerate()
+            {
+                let result = match index {
+                    0 => match snapshot.authentication {
+                        buaa_core::connectivity::Authentication::Online => "🟢 已认证".into(),
+                        buaa_core::connectivity::Authentication::Offline => "🟠 未认证".into(),
+                        buaa_core::connectivity::Authentication::Unknown => "⚪ 未知".into(),
+                    },
+                    1 => match snapshot.connectivity {
+                        buaa_core::connectivity::Connectivity::Available => "🟢 可用".into(),
+                        buaa_core::connectivity::Connectivity::Unavailable => "🔴 不可用".into(),
+                        buaa_core::connectivity::Connectivity::Unknown => "⚪ 未知".into(),
+                    },
+                    _ if task.schedule_reason == TaskScheduleReason::WaitingTrigger => "—".into(),
+                    _ => task.message.clone(),
+                };
+                SetWindowTextW(self.task_results[index], wide(&result).as_ptr());
+                let next = task
+                    .next_run_at
+                    .map(|v| format!("下次 {}", local_time(Some(v))))
+                    .unwrap_or_else(|| match task.schedule_reason {
+                        TaskScheduleReason::Disabled => "已关闭".into(),
+                        TaskScheduleReason::OnStart => "启动后立即".into(),
+                        TaskScheduleReason::WaitingTrigger => "—".into(),
+                        TaskScheduleReason::Cooldown => "冷却中".into(),
+                        TaskScheduleReason::Scheduled => "—".into(),
+                    });
+                SetWindowTextW(self.task_next[index], wide(&next).as_ptr());
+            }
         }
         SetWindowTextW(self.status, wide(message).as_ptr());
         self.tooltip(message);
@@ -1182,7 +1364,7 @@ impl App {
             cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
             fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
             nMin: 0,
-            nMax: self.px(600) - 1,
+            nMax: self.px(700) - 1,
             nPage: (area.bottom - area.top).max(0) as u32,
             nPos: self.scroll,
             nTrackPos: 0,
@@ -1249,13 +1431,124 @@ impl App {
             self.tooltip(text);
             Shell_NotifyIconW(NIM_MODIFY, &self.tray);
         }
-        self.lines
-            .push(format!("{}  {}", local_time(Some(unix_now())), text));
+        let line = format!("{}  {}", local_time(Some(unix_now())), text);
+        self.lines.push(line.clone());
+        let _ = append_log(&line);
         if self.lines.len() > 120 {
             self.lines.remove(0);
         }
         if self.active_page == 0 {
             self.render_history();
+        }
+    }
+    unsafe fn connectivity_changed(&self) {
+        let enabled =
+            SendMessageW(self.connectivity_probe, BM_GETCHECK, 0, 0) == BST_CHECKED as isize;
+        if !enabled {
+            SendMessageW(
+                self.browser_fallback,
+                BM_SETCHECK,
+                BST_UNCHECKED as usize,
+                0,
+            );
+        }
+        EnableWindow(
+            self.browser_fallback,
+            (enabled && self.handle.is_none()) as i32,
+        );
+        SetWindowTextW(
+            self.task_next[1],
+            wide(if enabled {
+                "启动后立即"
+            } else {
+                "已关闭"
+            })
+            .as_ptr(),
+        );
+        if !enabled {
+            SetWindowTextW(self.task_next[2], wide("已关闭").as_ptr());
+        } else {
+            SetWindowTextW(
+                self.task_next[2],
+                wide(
+                    if SendMessageW(self.browser_fallback, BM_GETCHECK, 0, 0)
+                        == BST_CHECKED as isize
+                    {
+                        "—"
+                    } else {
+                        "已关闭"
+                    },
+                )
+                .as_ptr(),
+            );
+        }
+        self.update_start_title();
+    }
+    unsafe fn run_test(&mut self, kind: TestKind) {
+        if kind != TestKind::Connectivity
+            && (text(self.username).trim().is_empty() || text(self.password).is_empty())
+        {
+            self.focus_setting(self.username);
+            return;
+        }
+        self.testing = Some(kind);
+        for button in self.test_buttons {
+            EnableWindow(button, 0);
+        }
+        let index = match kind {
+            TestKind::PortalAuth => 0,
+            TestKind::Connectivity => 1,
+            TestKind::Browser => 2,
+        };
+        SetWindowTextW(self.task_results[index], wide("正在测试…").as_ptr());
+        if let Some(handle) = self.handle.as_ref().filter(|_| !self.scanning) {
+            handle.signal.test(kind);
+            return;
+        }
+        let Some(config) = self.complete_configuration() else {
+            self.testing = None;
+            for button in self.test_buttons {
+                EnableWindow(button, 1);
+            }
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let window = self.window as usize;
+        match Handle::spawn(config, Mode::Test(kind), move |event| {
+            if tx.send(event).is_ok() {
+                PostMessageW(window as HWND, EVENTS, 0, 0);
+            }
+        }) {
+            Ok(handle) => {
+                self.handle = Some(handle);
+                self.receiver = Some(rx);
+                self.busy(true);
+            }
+            Err(error) => {
+                self.testing = None;
+                for button in self.test_buttons {
+                    EnableWindow(button, 1);
+                }
+                self.record(&error);
+            }
+        }
+    }
+    unsafe fn open_log_folder(&mut self) {
+        match log_folder().and_then(|path| {
+            std::fs::create_dir_all(&path).map_err(|_| "无法创建日志目录".to_string())?;
+            Ok(path)
+        }) {
+            Ok(path) => {
+                ShellExecuteW(
+                    self.window,
+                    wide("open").as_ptr(),
+                    wide(path.to_string_lossy().as_ref()).as_ptr(),
+                    null(),
+                    null(),
+                    SW_SHOWNORMAL,
+                );
+            }
+            Err(error) => self.record(&error),
         }
     }
     unsafe fn busy(&self, busy: bool) {
@@ -1264,14 +1557,23 @@ impl App {
             self.password,
             self.interval,
             self.gateway,
+            self.portal_auth,
+            self.connectivity_probe,
+            self.browser_fallback,
+            self.browser_path,
             self.interfaces,
             self.remember,
-            self.start,
             self.scan,
         ] {
             EnableWindow(c, (!busy) as i32);
         }
-        EnableWindow(self.stop, (busy && !self.scanning) as i32);
+        EnableWindow(
+            self.start,
+            (!self.scanning && self.testing.is_none()) as i32,
+        );
+        for button in self.test_buttons {
+            EnableWindow(button, self.testing.is_none() as i32);
+        }
         EnableWindow(self.settings_start, (!busy) as i32);
         SetWindowTextW(
             self.settings_hint,
@@ -1336,6 +1638,14 @@ impl App {
             },
             interval: seconds,
             gateway_ip,
+            portal_auth_enabled: SendMessageW(self.portal_auth, BM_GETCHECK, 0, 0)
+                == BST_CHECKED as isize,
+            connectivity_probe_enabled: SendMessageW(self.connectivity_probe, BM_GETCHECK, 0, 0)
+                == BST_CHECKED as isize,
+            browser_fallback: SendMessageW(self.browser_fallback, BM_GETCHECK, 0, 0)
+                == BST_CHECKED as isize,
+            browser_path: Some(text(self.browser_path).trim().to_owned())
+                .filter(|path| !path.is_empty()),
             interface: if scan {
                 None
             } else {
@@ -1453,20 +1763,48 @@ impl App {
                 }
             }
             if event.state == "stopped" {
+                let was_scanning = self.scanning;
+                self.scanning = false;
                 if let Some(wifi) = &self.wifi {
                     wifi.configure(self.wifi_enabled.clone(), false);
                 }
                 self.handle.take();
                 self.receiver.take();
+                self.testing = None;
                 self.busy(false);
                 self.load_credentials();
+                SetWindowTextW(
+                    self.task_next[0],
+                    wide(
+                        if SendMessageW(self.portal_auth, BM_GETCHECK, 0, 0) == BST_CHECKED as isize
+                        {
+                            "启动后立即"
+                        } else {
+                            "已关闭"
+                        },
+                    )
+                    .as_ptr(),
+                );
+                self.connectivity_changed();
                 if self.closing {
                     DestroyWindow(self.window);
                     return;
                 }
-                if self.scanning {
-                    self.scanning = false;
+                if was_scanning {
                     continue;
+                }
+            }
+            if event.state == "test_result" {
+                if let Some(kind) = self.testing.take() {
+                    let index = match kind {
+                        TestKind::PortalAuth => 0,
+                        TestKind::Connectivity => 1,
+                        TestKind::Browser => 2,
+                    };
+                    SetWindowTextW(self.task_results[index], wide(&event.message).as_ptr());
+                    for button in self.test_buttons {
+                        EnableWindow(button, 1);
+                    }
                 }
             }
             if event.state != "schedule" {
@@ -1484,8 +1822,16 @@ impl App {
         }
         if let Some(h) = &self.handle {
             h.signal.stop();
-            EnableWindow(self.stop, 0);
+            EnableWindow(self.start, 0);
+            SetWindowTextW(self.start, wide("正在停止…").as_ptr());
             self.record("正在停止…");
+        }
+    }
+    unsafe fn request_recovery(&self, mode: RecoveryMode) {
+        if let Some(handle) = self.handle.as_ref().filter(|_| !self.scanning) {
+            handle.signal.recover(mode);
+            EnableWindow(self.repair, 0);
+            EnableWindow(self.web_repair, 0);
         }
     }
     unsafe fn quit(&mut self) {
@@ -1599,7 +1945,7 @@ impl App {
     unsafe fn save_credentials(&self, config: &Config) -> Result<(), String> {
         let path = credential_path()?;
         std::fs::create_dir_all(path.parent().unwrap()).map_err(|_| "无法创建配置目录")?;
-        let settings = serde_json::json!({"interval":config.interval,"gateway":config.gateway_ip.to_string(),"interface":config.interface});
+        let settings = serde_json::json!({"interval":config.interval,"gateway":config.gateway_ip.to_string(),"interface":config.interface,"portal_auth_enabled":config.portal_auth_enabled,"connectivity_probe_enabled":config.connectivity_probe_enabled,"browser_fallback":config.browser_fallback,"browser_path":config.browser_path});
         atomic_write(
             &path.with_extension("settings.json"),
             &serde_json::to_vec(&settings).unwrap(),
@@ -1626,6 +1972,40 @@ impl App {
                 if let Some(g) = v["gateway"].as_str() {
                     SetWindowTextW(self.gateway, wide(g).as_ptr());
                 }
+                SendMessageW(
+                    self.browser_fallback,
+                    BM_SETCHECK,
+                    if v["browser_fallback"].as_bool().unwrap_or(true) {
+                        BST_CHECKED
+                    } else {
+                        BST_UNCHECKED
+                    } as usize,
+                    0,
+                );
+                SendMessageW(
+                    self.portal_auth,
+                    BM_SETCHECK,
+                    if v["portal_auth_enabled"].as_bool().unwrap_or(true) {
+                        BST_CHECKED
+                    } else {
+                        BST_UNCHECKED
+                    } as usize,
+                    0,
+                );
+                SendMessageW(
+                    self.connectivity_probe,
+                    BM_SETCHECK,
+                    if v["connectivity_probe_enabled"].as_bool().unwrap_or(true) {
+                        BST_CHECKED
+                    } else {
+                        BST_UNCHECKED
+                    } as usize,
+                    0,
+                );
+                SetWindowTextW(
+                    self.browser_path,
+                    wide(v["browser_path"].as_str().unwrap_or("")).as_ptr(),
+                );
                 self.restore_binding(v["interface"].as_str());
             }
         }
@@ -1672,6 +2052,50 @@ fn credential_path() -> Result<PathBuf, String> {
         PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("用户目录不可用")?)
             .join("BUAALoginNative/v1/credentials.dpapi"),
     )
+}
+fn log_folder() -> Result<PathBuf, String> {
+    Ok(
+        PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("用户目录不可用")?)
+            .join("BUAALoginNative/Logs"),
+    )
+}
+fn append_log(line: &str) -> Result<(), String> {
+    use std::io::Write;
+    let folder = log_folder()?;
+    std::fs::create_dir_all(&folder).map_err(|_| "无法创建日志目录")?;
+    let mut local: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe {
+        GetLocalTime(&mut local);
+    }
+    let path = folder.join(format!(
+        "BUAALogin-{:04}-{:02}-{:02}.log",
+        local.wYear, local.wMonth, local.wDay
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|_| "无法写入日志")?;
+    writeln!(file, "{line}").map_err(|_| "无法写入日志".into())
+}
+fn cleanup_logs() {
+    let Ok(folder) = log_folder() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&folder);
+    let cutoff =
+        std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(30 * 86400));
+    if let (Some(cutoff), Ok(entries)) = (cutoff, std::fs::read_dir(folder)) {
+        for entry in entries.flatten() {
+            if entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|m| m < cutoff)
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
@@ -1883,11 +2307,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 }
             }
             DM_GETDEFID => {
-                let id = if app.active_page == 0 {
-                    START
-                } else {
-                    SETTINGS_START
-                };
+                let id = START;
                 return ((DC_HASDEFID as usize) << 16 | id) as isize;
             }
             WM_COMMAND => {
@@ -1906,6 +2326,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                         SETTINGS_START,
                         AUTOSTART,
                         WIFI_AUTO,
+                        REPAIR,
+                        WEB_REPAIR,
+                        BROWSER_FALLBACK,
+                        PORTAL_AUTH,
+                        CONNECTIVITY_PROBE,
+                        TEST_PORTAL,
+                        TEST_CONNECTIVITY,
+                        TEST_BROWSER,
+                        OPEN_LOGS,
+                        CONNECTION_SETTINGS,
                     ]
                     .contains(&id)
                     && w >> 16 != BN_CLICKED as usize
@@ -1917,9 +2347,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                     SETTINGS_START => app.start_worker(false),
                     ADVANCED => app.toggle_advanced(),
                     HISTORY => app.toggle_history(),
+                    OPEN_LOGS => app.open_log_folder(),
+                    CONNECTION_SETTINGS => {
+                        app.show_page(1);
+                        app.settings_scroll = app.px(270);
+                        app.update_settings_scroll();
+                    }
                     AUTOSTART => app.startup_changed(),
                     20..=22 if w >> 16 == EN_CHANGE as usize => app.update_start_title(),
                     STOP => app.stop_worker(),
+                    REPAIR => app.request_recovery(RecoveryMode::Protocol),
+                    WEB_REPAIR => app.request_recovery(RecoveryMode::Browser),
+                    TEST_PORTAL => app.run_test(TestKind::PortalAuth),
+                    TEST_CONNECTIVITY => app.run_test(TestKind::Connectivity),
+                    TEST_BROWSER => app.run_test(TestKind::Browser),
+                    CONNECTIVITY_PROBE => app.connectivity_changed(),
+                    PORTAL_AUTH => {
+                        SetWindowTextW(
+                            app.task_next[0],
+                            wide(
+                                if SendMessageW(app.portal_auth, BM_GETCHECK, 0, 0)
+                                    == BST_CHECKED as isize
+                                {
+                                    "启动后立即"
+                                } else {
+                                    "已关闭"
+                                },
+                            )
+                            .as_ptr(),
+                        );
+                        app.update_start_title();
+                    }
+                    BROWSER_FALLBACK => app.connectivity_changed(),
                     SCAN => app.start_worker(true),
                     HIDE => {
                         ShowWindow(hwnd, SW_HIDE);
@@ -2138,7 +2597,7 @@ pub fn run() {
             left: 0,
             top: 0,
             right: 680 * dpi / 96,
-            bottom: 600 * dpi / 96,
+            bottom: 700 * dpi / 96,
         };
         AdjustWindowRectEx(&mut frame, style, 0, 0);
         let mut work: RECT = std::mem::zeroed();

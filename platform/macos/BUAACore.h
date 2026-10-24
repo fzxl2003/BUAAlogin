@@ -8,6 +8,8 @@ BuaaClient *buaa_create(const char *config_json, BuaaCallback callback, void *co
 int32_t buaa_start(BuaaClient *client);
 int32_t buaa_scan(BuaaClient *client);
 void buaa_stop(BuaaClient *client);
+int32_t buaa_recover(BuaaClient *client, uint32_t mode);
+int32_t buaa_test(BuaaClient *client, uint32_t kind);
 void buaa_network_changed(BuaaClient *client);
 void buaa_network_changed_interface(BuaaClient *client, const char *name);
 void buaa_suspend(BuaaClient *client);

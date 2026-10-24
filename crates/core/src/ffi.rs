@@ -1,7 +1,7 @@
 //! Version 1 C ABI. Input strings are borrowed for the call; event JSON is
 //! borrowed only during callback. free joins the worker before dropping context.
 use crate::{
-    engine::{Handle, Mode},
+    engine::{Handle, Mode, TestKind},
     Config,
 };
 use std::{
@@ -14,6 +14,7 @@ pub struct Client {
     callback: Callback,
     context: usize,
     handle: Option<Handle>,
+    mode: Option<Mode>,
 }
 #[no_mangle]
 pub extern "C" fn buaa_abi_version() -> u32 {
@@ -43,6 +44,7 @@ pub unsafe extern "C" fn buaa_create(
             callback: callback.unwrap(),
             context: context as usize,
             handle: None,
+            mode: None,
         }))
     }))
     .unwrap_or(std::ptr::null_mut())
@@ -67,6 +69,7 @@ unsafe fn start(client: *mut Client, mode: Mode) -> i32 {
         }) {
             Ok(handle) => {
                 client.handle = Some(handle);
+                client.mode = Some(mode);
                 0
             }
             Err(_) => -3,
@@ -107,6 +110,56 @@ unsafe fn signal(client: *mut Client, action: u32) {
 #[no_mangle]
 pub unsafe extern "C" fn buaa_stop(client: *mut Client) {
     signal(client, 0);
+}
+/// # Safety
+/// The client must be live (or null), used serially by its owning thread.
+#[no_mangle]
+pub unsafe extern "C" fn buaa_recover(client: *mut Client, mode: u32) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(client) = client.as_ref() else {
+            return -1;
+        };
+        let Some(handle) = client
+            .handle
+            .as_ref()
+            .filter(|handle| !handle.is_finished())
+        else {
+            return -2;
+        };
+        let mode = match mode {
+            0 => crate::engine::RecoveryMode::Protocol,
+            1 => crate::engine::RecoveryMode::Browser,
+            _ => return -3,
+        };
+        handle.signal.recover(mode);
+        0
+    }))
+    .unwrap_or(-4)
+}
+/// Run one real diagnostic. A live monitor serializes it with scheduled work;
+/// an idle client starts a one-shot worker.
+#[no_mangle]
+pub unsafe extern "C" fn buaa_test(client: *mut Client, kind: u32) -> i32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(client) = client.as_mut() else {
+            return -1;
+        };
+        let kind = match kind {
+            0 => TestKind::PortalAuth,
+            1 => TestKind::Connectivity,
+            2 => TestKind::Browser,
+            _ => return -3,
+        };
+        if let Some(handle) = client.handle.as_ref().filter(|h| !h.is_finished()) {
+            if matches!(client.mode, Some(Mode::Monitor)) {
+                handle.signal.test(kind);
+                return 0;
+            }
+            return -2;
+        }
+        start(client, Mode::Test(kind))
+    }))
+    .unwrap_or(-4)
 }
 /// # Safety
 /// The client must be live (or null), used serially by its owning thread.
@@ -188,6 +241,8 @@ mod tests {
             )
             .is_null());
             assert_eq!(buaa_start(std::ptr::null_mut()), -1);
+            assert_eq!(buaa_recover(std::ptr::null_mut(), 0), -1);
+            assert_eq!(buaa_test(std::ptr::null_mut(), 0), -1);
             buaa_stop(std::ptr::null_mut());
             buaa_free(std::ptr::null_mut());
         }
@@ -200,6 +255,7 @@ mod tests {
             let json = c"{\"username\":\"test\",\"password\":\"test\",\"interface\":\"nonexistent-test-interface\",\"external_timer\":true}";
             let client = buaa_create(json.as_ptr(), Some(receive), context as _);
             assert!(!client.is_null());
+            assert_eq!(buaa_recover(client, 0), -2);
             assert_eq!(buaa_start(client), 0);
             // UI snapshots may precede the lifecycle event. Keep the same bounded wait.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -213,6 +269,8 @@ mod tests {
             };
             assert_eq!(first.state, "waiting_network");
             assert_eq!(buaa_start(client), -2);
+            assert_eq!(buaa_recover(client, 2), -3);
+            assert_eq!(buaa_test(client, 3), -3);
             buaa_stop(client);
             buaa_free(client);
             let events: Vec<_> = rx.try_iter().collect();
