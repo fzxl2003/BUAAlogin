@@ -46,6 +46,8 @@ const OPEN_LOGS: usize = 46;
 const CONNECTION_SETTINGS: usize = 47;
 const ACCOUNT_SETTINGS: usize = 48;
 const SAVE_SETTINGS: usize = 49;
+const GENERAL_SETTINGS: usize = 52;
+const WIFI_SETTINGS: usize = 53;
 const START: usize = 10;
 const STOP: usize = 11;
 const SCAN: usize = 12;
@@ -53,6 +55,10 @@ const HIDE: usize = 13;
 const SHOW: usize = 14;
 const QUIT: usize = 15;
 const REMEMBER: usize = 16;
+const WINDOW_WIDTH: i32 = 800;
+const WINDOW_HEIGHT: i32 = 672;
+const CONTENT_INSET_X: i32 = 20;
+const CONTENT_INSET_Y: i32 = 16;
 
 #[derive(Clone)]
 struct InterfaceOption {
@@ -86,7 +92,6 @@ struct App {
     browser_path: HWND,
     scan: HWND,
     status: HWND,
-    history: HWND,
     traffic_progress: HWND,
     traffic_label: HWND,
     traffic_total: HWND,
@@ -99,7 +104,6 @@ struct App {
     settings_scroll: i32,
     active_page: usize,
     startup: HWND,
-    history_button: HWND,
     dashboard_values: [HWND; 6],
     state_title: HWND,
     state_icon: HWND,
@@ -114,7 +118,7 @@ struct App {
     interface_gateways: HashMap<String, Ipv4Addr>,
     interface_options: Vec<InterfaceOption>,
     traffic_used_bytes: Option<u64>,
-    lines: Vec<String>,
+    traffic_total_bytes: Option<u64>,
     handle: Option<Handle>,
     receiver: Option<Receiver<Event>>,
     closing: bool,
@@ -149,7 +153,6 @@ impl App {
             browser_path: null_mut(),
             scan: null_mut(),
             status: null_mut(),
-            history: null_mut(),
             traffic_progress: null_mut(),
             traffic_label: null_mut(),
             traffic_total: null_mut(),
@@ -162,7 +165,6 @@ impl App {
             settings_scroll: 0,
             active_page: 0,
             startup: null_mut(),
-            history_button: null_mut(),
             dashboard_values: [null_mut(); 6],
             state_title: null_mut(),
             state_icon: null_mut(),
@@ -177,7 +179,7 @@ impl App {
             interface_gateways: HashMap::new(),
             interface_options: vec![],
             traffic_used_bytes: None,
-            lines: vec![],
+            traffic_total_bytes: None,
             handle: None,
             receiver: None,
             closing: false,
@@ -222,6 +224,12 @@ impl App {
             (x, y, width, height)
         };
         let style = if field { style & !WS_BORDER } else { style };
+        // Give the dashboard and its navigation the same additional outer breathing room.
+        let (x, y) = if self.building_page.get() == Some(0) || id == PAGES {
+            (x + CONTENT_INSET_X, y + CONTENT_INSET_Y)
+        } else {
+            (x, y)
+        };
         let hwnd = CreateWindowExW(
             0,
             wide(class).as_ptr(),
@@ -270,10 +278,11 @@ impl App {
         let p = self.palette;
         let mut area: RECT = std::mem::zeroed();
         GetClientRect(hwnd, &mut area);
-        appearance::fill(dc, &area, if settings { p.surface } else { p.background });
+        appearance::fill(dc, &area, p.background);
         if settings {
             for (control, x, y, width, height) in [
                 (self.traffic_total, 170, 90, 180, 30),
+                (GetDlgItem(self.settings_pane, 51), 170, 140, 180, 30),
                 (self.browser_path, 20, 216, 544, 30),
             ] {
                 appearance::rounded(
@@ -288,18 +297,16 @@ impl App {
                     },
                 );
             }
-            let y = self.px(296) - self.settings_scroll;
-            appearance::line(dc, self.px(20), y, self.px(564), y, p.border);
         } else if self.active_page == 0 {
-            for (y, height) in [(80, 98), (190, 144), (346, 124)] {
-                appearance::rounded(
-                    dc,
-                    &self.rect(32, y, 616, height, self.scroll),
-                    self.px(16),
-                    p.surface,
-                    p.border,
-                );
-            }
+            let y = self.px(192 + CONTENT_INSET_Y) - self.scroll;
+            appearance::line(
+                dc,
+                self.px(40 + CONTENT_INSET_X),
+                y,
+                self.px(720 + CONTENT_INSET_X),
+                y,
+                p.border,
+            );
         }
         RestoreDC(dc, saved);
         EndPaint(hwnd, &ps);
@@ -310,20 +317,7 @@ impl App {
             || self.dashboard_values.contains(&control)
             || SendMessageW(control, WM_GETFONT, 0, 0) == self.heading_font as isize;
         SetTextColor(dc, if edit || prominent { p.text } else { p.muted });
-        let mut area: RECT = std::mem::zeroed();
-        GetWindowRect(control, &mut area);
-        MapWindowPoints(
-            null_mut(),
-            self.window,
-            &mut area as *mut RECT as *mut POINT,
-            2,
-        );
-        let y = area.top + self.scroll;
-        let card = GetParent(control) == self.settings_pane
-            || control == self.history
-            || edit
-            || (self.active_page == 0 && y >= self.px(80) && y < self.px(470));
-        let color = if card { p.surface } else { p.background };
+        let color = if edit { p.surface } else { p.background };
         SetBkColor(dc, color);
         SetBkMode(dc, TRANSPARENT as i32);
         appearance::brush(dc, color) as isize
@@ -338,13 +332,17 @@ impl App {
             let color = match self.state_kind.get() {
                 1 => p.success,
                 2 => p.warning,
+                3 => p.muted,
                 _ => p.accent,
             };
-            let bg = if p.high_contrast { p.surface } else { p.soft };
-            appearance::fill(dc, &rect, p.surface);
-            appearance::rounded(dc, &rect, self.px(18), bg, bg);
+            appearance::fill(dc, &rect, p.background);
+            let old_brush = SelectObject(dc, appearance::brush(dc, color));
+            let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+            Ellipse(dc, rect.left, rect.top, rect.right, rect.bottom);
+            SelectObject(dc, old_pen);
+            SelectObject(dc, old_brush);
             // The symbol has a textual status alongside it, so color is never the only cue.
-            let pen = CreatePen(PS_SOLID, self.px(2).max(2), color);
+            let pen = CreatePen(PS_SOLID, self.px(3).max(2), p.accent_text);
             let old_pen = SelectObject(dc, pen);
             let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
             let x = rect.left;
@@ -416,11 +414,7 @@ impl App {
             };
             let disabled = item.itemState & ODS_DISABLED != 0;
             let primary = item.CtlID as usize == START;
-            let background = if GetParent(item.hwndItem) == self.settings_pane {
-                p.surface
-            } else {
-                p.background
-            };
+            let background = p.background;
             appearance::fill(dc, &rect, background);
             let contrast_selected = p.high_contrast && tab && selected;
             let fill = if disabled {
@@ -492,6 +486,60 @@ impl App {
         }
         RestoreDC(dc, saved);
     }
+    // Keep native progress/text controls and their accessible values. Only their
+    // pixels are drawn here; no additional timers, surfaces or status polling.
+    unsafe fn paint_display(&self, hwnd: HWND) {
+        let mut ps: PAINTSTRUCT = std::mem::zeroed();
+        let dc = BeginPaint(hwnd, &mut ps);
+        let saved = SaveDC(dc);
+        let p = self.palette;
+        let mut rect: RECT = std::mem::zeroed();
+        GetClientRect(hwnd, &mut rect);
+        appearance::fill(dc, &rect, p.background);
+        if hwnd == self.traffic_progress {
+            let height = rect.bottom - rect.top;
+            let track = if p.high_contrast { p.surface } else { p.border };
+            appearance::rounded(dc, &rect, height, track, p.border);
+            let progress = SendMessageW(hwnd, PBM_GETPOS, 0, 0).clamp(0, 1000) as i32;
+            let width = ((rect.right - rect.left) * progress + 500) / 1000;
+            if width > 0 {
+                let mut filled = rect;
+                filled.right = filled.left + width;
+                appearance::rounded(dc, &filled, height.min(width), p.accent, p.accent);
+            }
+        } else {
+            let mut chars = [0u16; 512];
+            let len = GetWindowTextW(hwnd, chars.as_mut_ptr(), chars.len() as i32).max(0) as usize;
+            let label = &chars[..len];
+            let badge = if hwnd == self.task_results[0] || hwnd == self.task_results[1] {
+                appearance::badge_color(label, p)
+            } else {
+                None
+            };
+            if let Some(color) = badge {
+                let diameter = self.px(10);
+                let top = (rect.bottom - diameter) / 2;
+                let old_brush = SelectObject(dc, appearance::brush(dc, color));
+                let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+                Ellipse(dc, 0, top, diameter, top + diameter);
+                SelectObject(dc, old_pen);
+                SelectObject(dc, old_brush);
+                rect.left += self.px(17);
+            }
+            SetBkMode(dc, TRANSPARENT as i32);
+            SetTextColor(dc, p.text);
+            SelectObject(dc, self.font);
+            DrawTextW(
+                dc,
+                chars.as_ptr(),
+                len as i32,
+                &mut rect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+        }
+        RestoreDC(dc, saved);
+        EndPaint(hwnd, &ps);
+    }
     unsafe fn paint_navigation(&self, hwnd: HWND) {
         let mut ps: PAINTSTRUCT = std::mem::zeroed();
         let dc = BeginPaint(hwnd, &mut ps);
@@ -556,9 +604,9 @@ impl App {
         // Explicit UI family avoids the classic bitmap/serif fallback on Chinese Windows.
         // Three shared fonts, the same count as the previous UI.
         for (slot, height, weight) in [
-            (&mut self.font, 14, FW_NORMAL),
-            (&mut self.heading_font, 15, FW_SEMIBOLD),
-            (&mut self.title_font, 24, FW_SEMIBOLD),
+            (&mut self.font, 15, FW_NORMAL),
+            (&mut self.heading_font, 17, FW_SEMIBOLD),
+            (&mut self.title_font, 26, FW_SEMIBOLD),
         ] {
             *slot = CreateFontW(
                 -(height * self.dpi / 96),
@@ -582,8 +630,8 @@ impl App {
             "SysTabControl32",
             "",
             WS_TABSTOP | WS_CLIPSIBLINGS | TCS_FIXEDWIDTH,
-            200,
-            22,
+            240,
+            28,
             280,
             38,
             PAGES,
@@ -621,28 +669,28 @@ impl App {
             wide("BUAALoginSettingsPane").as_ptr(),
             wide("").as_ptr(),
             WS_CHILD | WS_VSCROLL | WS_CLIPCHILDREN,
-            self.px(32),
-            self.px(80),
-            self.px(616),
-            self.px(524),
+            self.px((WINDOW_WIDTH - 584) / 2),
+            self.px(90 + CONTENT_INSET_Y),
+            self.px(584),
+            self.px(492),
             self.window,
             null_mut(),
             GetModuleHandleW(null()),
             self as *mut _ as _,
         );
         self.building_page.set(Some(0));
-        self.state_icon = self.control("STATIC", "连接状态", SS_OWNERDRAW, 52, 98, 48, 48, 0);
+        self.state_icon = self.control("STATIC", "连接状态", SS_OWNERDRAW, 56, 108, 48, 48, 0);
         self.state_title =
-            self.control("STATIC", "北航校园网", SS_ENDELLIPSIS, 120, 94, 504, 36, 0);
+            self.control("STATIC", "北航校园网", SS_ENDELLIPSIS, 140, 96, 380, 42, 0);
         SendMessageW(self.state_title, WM_SETFONT, self.title_font as usize, 1);
         self.status = self.control(
             "STATIC",
             "请设置账号并检测校园网接口。",
             0,
-            120,
-            135,
-            504,
-            36,
+            140,
+            145,
+            380,
+            40,
             0,
         );
         self.update_state("idle");
@@ -657,11 +705,16 @@ impl App {
         .iter()
         .enumerate()
         {
-            let x = 48 + (index as i32 % 3) * 202;
-            let y = 200 + (index as i32 / 3) * 50;
-            self.label(title, x, y, 180);
+            let x = 40 + (index as i32 % 3) * 228;
+            let y = 212 + (index as i32 / 3) * 60;
+            let label_width = match index {
+                0 => 40,
+                1 | 2 => 72,
+                _ => 180,
+            };
+            self.label(title, x, y, label_width);
             self.dashboard_values[index] =
-                self.control("STATIC", "—", SS_ENDELLIPSIS, x, y + 20, 180, 24, 0);
+                self.control("STATIC", "—", SS_ENDELLIPSIS, x, y + 25, 208, 28, 0);
             SendMessageW(
                 self.dashboard_values[index],
                 WM_SETFONT,
@@ -670,80 +723,101 @@ impl App {
             );
         }
         self.account_value = self.dashboard_values[0];
-        for control in [self.dashboard_values[0], self.dashboard_values[1]] {
-            SetWindowPos(
-                control,
-                null_mut(),
-                0,
-                0,
-                self.px(84),
-                self.px(24),
-                SWP_NOMOVE | SWP_NOZORDER,
-            );
-        }
         self.control(
             "BUTTON",
             "设置…",
             WS_TABSTOP,
-            144,
-            218,
-            82,
-            29,
+            92,
+            209,
+            66,
+            26,
             ACCOUNT_SETTINGS,
         );
         self.control(
             "BUTTON",
-            "接口设置…",
+            "网络设置…",
             WS_TABSTOP,
-            342,
-            218,
-            94,
-            29,
+            348,
+            209,
+            88,
+            26,
             CONNECTION_SETTINGS,
         );
+        self.control(
+            "BUTTON",
+            "设置",
+            WS_TABSTOP,
+            576,
+            209,
+            66,
+            26,
+            GENERAL_SETTINGS,
+        );
 
-        self.label("流量使用情况", 48, 300, 160);
-        self.traffic_progress =
-            self.control("msctls_progress32", "", PBS_SMOOTH, 48, 320, 584, 10, 0);
+        self.label("流量使用情况", 40, 346, 180);
+        self.traffic_progress = self.control(
+            "msctls_progress32",
+            "流量使用情况",
+            PBS_SMOOTH,
+            40,
+            375,
+            440,
+            7,
+            0,
+        );
+        // Classic mode avoids themed progress animation; the native value remains accessible.
+        SetWindowTheme(self.traffic_progress, wide("").as_ptr(), wide("").as_ptr());
         SendMessageW(self.traffic_progress, PBM_SETRANGE32, 0, 1000);
+        SetWindowSubclass(
+            self.traffic_progress,
+            Some(display_proc),
+            1,
+            self as *const _ as usize,
+        );
         self.traffic_label = self.control(
             "STATIC",
             "尚未获取流量",
             SS_ENDELLIPSIS,
-            208,
-            300,
-            424,
-            24,
+            40,
+            394,
+            680,
+            28,
             0,
+        );
+        SendMessageW(
+            self.traffic_label,
+            WM_SETFONT,
+            self.heading_font as usize,
+            1,
         );
         self.portal_auth = self.control(
             "BUTTON",
             "校园网认证（普通连接）",
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            48,
-            362,
-            190,
-            25,
+            40,
+            450,
+            226,
+            28,
             PORTAL_AUTH,
         );
         self.connectivity_probe = self.control(
             "BUTTON",
             "外网可用性检测",
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            48,
-            398,
-            190,
-            25,
+            40,
+            504,
+            226,
+            28,
             CONNECTIVITY_PROBE,
         );
         self.browser_fallback = self.control(
             "BUTTON",
             "网页兜底",
             BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-            48,
-            434,
-            190,
-            25,
+            40,
+            558,
+            226,
+            28,
             BROWSER_FALLBACK,
         );
         for control in [
@@ -753,27 +827,33 @@ impl App {
         ] {
             SendMessageW(control, BM_SETCHECK, BST_CHECKED as usize, 0);
         }
-        for (index, y) in [362, 398, 434].iter().enumerate() {
+        for (index, y) in [450, 504, 558].iter().enumerate() {
             self.task_results[index] =
-                self.control("STATIC", "尚未运行", SS_ENDELLIPSIS, 250, *y, 156, 24, 0);
+                self.control("STATIC", "尚未运行", SS_ENDELLIPSIS, 280, *y, 174, 28, 0);
+            SetWindowSubclass(
+                self.task_results[index],
+                Some(display_proc),
+                1,
+                self as *const _ as usize,
+            );
             self.task_next[index] = self.control(
                 "STATIC",
                 if index == 2 { "—" } else { "启动后立即" },
                 SS_ENDELLIPSIS,
-                414,
+                470,
                 *y,
-                130,
-                24,
+                164,
+                28,
                 0,
             );
             self.test_buttons[index] = self.control(
                 "BUTTON",
                 "测试",
                 WS_TABSTOP,
-                548,
-                *y - 3,
-                68,
-                29,
+                650,
+                *y - 1,
+                70,
+                30,
                 TEST_PORTAL + index,
             );
         }
@@ -781,10 +861,10 @@ impl App {
             "BUTTON",
             "设置账号",
             BS_DEFPUSHBUTTON as u32 | WS_TABSTOP,
-            462,
-            486,
-            186,
-            38,
+            538,
+            112,
+            182,
+            40,
             START,
         );
 
@@ -814,7 +894,7 @@ impl App {
         );
         self.control(
             "STATIC",
-            "登录系统后自动启动；需先在账号弹窗中保存完整凭据。",
+            "登录系统后自动启动；请先保存完整账号凭据。",
             0,
             210,
             49,
@@ -822,7 +902,7 @@ impl App {
             22,
             0,
         );
-        self.label("总流量（GB）", 20, 96, 140);
+        self.label("备用额度（GB）", 20, 96, 140);
         self.traffic_total = self.control(
             "EDIT",
             "",
@@ -833,7 +913,7 @@ impl App {
             30,
             50,
         );
-        self.label("留空时只显示已用流量，不计算百分比。", 368, 96, 196);
+        self.label("通常留空，自动读取额度", 368, 96, 196);
         self.label("检查周期（秒）", 20, 146, 140);
         let interval_setting = self.control(
             "EDIT",
@@ -873,31 +953,34 @@ impl App {
             30,
             SAVE_SETTINGS,
         );
-        let recent = self.label("最近活动", 20, 314, 300);
-        SendMessageW(recent, WM_SETFONT, self.heading_font as usize, 1);
-        self.history_button = self.control(
+        let wifi_title = self.label("校园网选择", 20, 318, 300);
+        SendMessageW(wifi_title, WM_SETFONT, self.heading_font as usize, 1);
+        self.label("BUAA-WiFi / BUAA-WiFi-Free", 20, 360, 386);
+        self.control(
+            "BUTTON",
+            "选择校园网…",
+            WS_TABSTOP,
+            426,
+            352,
+            138,
+            32,
+            WIFI_SETTINGS,
+        );
+        self.label(
+            "可选择一种或同时选择两种；请先停止自动连接再修改。",
+            20,
+            400,
+            550,
+        );
+        self.control(
             "BUTTON",
             "打开日志文件夹",
             WS_TABSTOP,
             408,
-            306,
+            446,
             156,
             30,
             OPEN_LOGS,
-        );
-        self.history = self.control(
-            "EDIT",
-            "暂无活动记录",
-            ES_MULTILINE as u32
-                | ES_READONLY as u32
-                | ES_AUTOVSCROLL as u32
-                | WS_VSCROLL
-                | WS_TABSTOP,
-            20,
-            352,
-            544,
-            240,
-            0,
         );
         self.scan = null_mut();
         if let Ok(path) = wifi_path() {
@@ -1012,32 +1095,49 @@ impl App {
             self.settings_pane,
             if index == 1 { SW_SHOW } else { SW_HIDE },
         );
-        if index == 1 {
-            self.render_history();
-        }
-        self.resize_for_page(index);
+        self.scroll_to(0);
+        self.resize_window();
         SetFocus(self.tabs);
         InvalidateRect(self.tabs, null(), 1);
         InvalidateRect(self.window, null(), 1);
     }
-    unsafe fn resize_for_page(&self, index: usize) {
+    unsafe fn resize_window(&self) {
         let style =
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VSCROLL | WS_CLIPCHILDREN;
         let mut frame = RECT {
             left: 0,
             top: 0,
-            right: self.px(680),
-            bottom: self.px(if index == 0 { 540 } else { 660 }),
+            right: self.px(WINDOW_WIDTH),
+            bottom: self.px(WINDOW_HEIGHT),
         };
         AdjustWindowRectEx(&mut frame, style, 0, 0);
+        let mut current: RECT = std::mem::zeroed();
+        GetWindowRect(self.window, &mut current);
+        let mut width = frame.right - frame.left;
+        let mut height = frame.bottom - frame.top;
+        let mut x = current.left;
+        let mut y = current.top;
+        let mut monitor: MONITORINFO = std::mem::zeroed();
+        monitor.cbSize = std::mem::size_of_val(&monitor) as u32;
+        if GetMonitorInfoW(
+            MonitorFromWindow(self.window, MONITOR_DEFAULTTONEAREST),
+            &mut monitor,
+        ) != 0
+        {
+            let work = monitor.rcWork;
+            width = width.min(work.right - work.left);
+            height = height.min(work.bottom - work.top);
+            x = x.clamp(work.left, work.right - width);
+            y = y.clamp(work.top, work.bottom - height);
+        }
         SetWindowPos(
             self.window,
             null_mut(),
-            0,
-            0,
-            frame.right - frame.left,
-            frame.bottom - frame.top,
-            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            x,
+            y,
+            width,
+            height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
         );
     }
     unsafe fn update_settings_scroll(&mut self) {
@@ -1050,7 +1150,7 @@ impl App {
             cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
             fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
             nMin: 0,
-            nMax: self.px(612) - 1,
+            nMax: self.px(492) - 1,
             nPage: (area.bottom - area.top).max(0) as u32,
             nPos: self.settings_scroll,
             nTrackPos: 0,
@@ -1248,6 +1348,12 @@ impl App {
         if let Some(used) = snapshot.traffic_used_bytes {
             self.traffic_used_bytes = Some(used);
         }
+        if let Some(details) = snapshot.traffic_details {
+            self.traffic_used_bytes = Some(details.used_bytes);
+        }
+        self.traffic_total_bytes = snapshot
+            .traffic_details
+            .and_then(|details| details.total_bytes);
         self.update_traffic();
         if snapshot.phase != "stopped" {
             for (index, task) in [
@@ -1260,14 +1366,14 @@ impl App {
             {
                 let result = match index {
                     0 => match snapshot.authentication {
-                        buaa_core::connectivity::Authentication::Online => "🟢 已认证".into(),
-                        buaa_core::connectivity::Authentication::Offline => "🟠 未认证".into(),
-                        buaa_core::connectivity::Authentication::Unknown => "⚪ 未知".into(),
+                        buaa_core::connectivity::Authentication::Online => "已认证".into(),
+                        buaa_core::connectivity::Authentication::Offline => "未认证".into(),
+                        buaa_core::connectivity::Authentication::Unknown => "未知".into(),
                     },
                     1 => match snapshot.connectivity {
-                        buaa_core::connectivity::Connectivity::Available => "🟢 可用".into(),
-                        buaa_core::connectivity::Connectivity::Unavailable => "🔴 不可用".into(),
-                        buaa_core::connectivity::Connectivity::Unknown => "⚪ 未知".into(),
+                        buaa_core::connectivity::Connectivity::Available => "可用".into(),
+                        buaa_core::connectivity::Connectivity::Unavailable => "不可用".into(),
+                        buaa_core::connectivity::Connectivity::Unknown => "未知".into(),
                     },
                     _ if task.schedule_reason == TaskScheduleReason::WaitingTrigger => "—".into(),
                     _ => task.message.clone(),
@@ -1297,7 +1403,7 @@ impl App {
             cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
             fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
             nMin: 0,
-            nMax: self.px(if self.active_page == 0 { 540 } else { 660 }) - 1,
+            nMax: self.px(WINDOW_HEIGHT) - 1,
             nPage: (area.bottom - area.top).max(0) as u32,
             nPos: self.scroll,
             nTrackPos: 0,
@@ -1320,27 +1426,56 @@ impl App {
         SetScrollInfo(self.window, SB_VERT, &info, 1);
         GetScrollInfo(self.window, SB_VERT, &mut info);
         self.scroll = info.nPos;
-        ScrollWindowEx(
+        if old == self.scroll {
+            return;
+        }
+        // Move every direct child, including controls entirely below the viewport.
+        let mut child = GetWindow(self.window, GW_CHILD);
+        while !child.is_null() {
+            let next = GetWindow(child, GW_HWNDNEXT);
+            let mut rect: RECT = std::mem::zeroed();
+            GetWindowRect(child, &mut rect);
+            MapWindowPoints(
+                null_mut(),
+                self.window,
+                &mut rect as *mut RECT as *mut POINT,
+                2,
+            );
+            SetWindowPos(
+                child,
+                null_mut(),
+                rect.left,
+                rect.top + old - self.scroll,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
+            );
+            child = next;
+        }
+        RedrawWindow(
             self.window,
-            0,
-            old - self.scroll,
-            null(),
             null(),
             null_mut(),
-            null_mut(),
-            SW_SCROLLCHILDREN | SW_INVALIDATE | SW_ERASE,
+            RDW_INVALIDATE | RDW_ALLCHILDREN,
         );
     }
-    unsafe fn render_history(&self) {
-        let start = self.lines.len().saturating_sub(40);
-        let text = if self.lines.is_empty() {
-            "暂无活动记录".into()
-        } else {
-            self.lines[start..].join("\r\n")
-        };
-        SetWindowTextW(self.history, wide(&text).as_ptr());
-        SendMessageW(self.history, EM_SETSEL, text.encode_utf16().count(), -1);
-        SendMessageW(self.history, EM_SCROLLCARET, 0, 0);
+    unsafe fn ensure_main_visible(&mut self, field: HWND) {
+        let mut rect: RECT = std::mem::zeroed();
+        let mut area: RECT = std::mem::zeroed();
+        GetWindowRect(field, &mut rect);
+        MapWindowPoints(
+            null_mut(),
+            self.window,
+            &mut rect as *mut RECT as *mut POINT,
+            2,
+        );
+        GetClientRect(self.window, &mut area);
+        let margin = self.px(12);
+        if rect.top < margin {
+            self.scroll_to(self.scroll + rect.top - margin);
+        } else if rect.bottom > area.bottom - margin {
+            self.scroll_to(self.scroll + rect.bottom - area.bottom + margin);
+        }
     }
     unsafe fn tooltip(&mut self, text: &str) {
         self.tray.szTip.fill(0);
@@ -1361,14 +1496,7 @@ impl App {
             Shell_NotifyIconW(NIM_MODIFY, &self.tray);
         }
         let line = format!("{}  {}", local_time(Some(unix_now())), text);
-        self.lines.push(line.clone());
         let _ = append_log(&line);
-        if self.lines.len() > 120 {
-            self.lines.remove(0);
-        }
-        if self.active_page == 1 {
-            self.render_history();
-        }
     }
     unsafe fn connectivity_changed(&self) {
         let enabled =
@@ -1999,10 +2127,43 @@ impl App {
             self.record("账号设置已保存");
         }
     }
-    unsafe fn show_interface_detail_dialog(&mut self, owner: HWND, index: usize) {
-        let Some(option) = self.interface_options.get(index).cloned() else {
+    unsafe fn show_wifi_dialog(&mut self) {
+        if self.handle.is_some() {
+            MessageBoxW(
+                self.window,
+                wide("请先停止自动连接，再选择校园网。").as_ptr(),
+                wide("校园网选择").as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
             return;
+        }
+        self.refresh_wifi_options();
+        let first = self
+            .interface_options
+            .iter()
+            .position(|option| option.wifi_id.is_some());
+        let count = self
+            .interface_options
+            .iter()
+            .filter(|option| option.wifi_id.is_some())
+            .count();
+        if let Some(index) = first.filter(|_| count == 1) {
+            if self.show_interface_detail_dialog(self.window, index) {
+                if let Some(config) = self.configuration(false) {
+                    if let Err(error) = self.save_preferences(&config) {
+                        self.record(&error);
+                    }
+                }
+            }
+        } else {
+            self.show_interface_dialog();
+        }
+    }
+    unsafe fn show_interface_detail_dialog(&mut self, owner: HWND, index: usize) -> bool {
+        let Some(option) = self.interface_options.get(index).cloned() else {
+            return false;
         };
+        let mut saved = false;
         let wifi_targets = option
             .wifi_id
             .as_ref()
@@ -2010,7 +2171,12 @@ impl App {
             .cloned()
             .unwrap_or_default();
         let height = if option.wifi_id.is_some() { 370 } else { 240 };
-        let dialog = self.modal_window(owner, &format!("接口详情 · {}", option.name), 500, height);
+        let title = if option.wifi_id.is_some() {
+            "校园网选择"
+        } else {
+            "接口详情"
+        };
+        let dialog = self.modal_window(owner, &format!("{title} · {}", option.name), 500, height);
         self.modal_control(
             dialog,
             "STATIC",
@@ -2181,6 +2347,7 @@ impl App {
                             }
                             let _ = self.persist_wifi_networks();
                         }
+                        saved = true;
                         break 'messages;
                     }
                     _ => {}
@@ -2194,6 +2361,7 @@ impl App {
         DestroyWindow(dialog);
         EnableWindow(owner, 1);
         SetForegroundWindow(owner);
+        saved
     }
     unsafe fn show_interface_dialog(&mut self) {
         if self.handle.is_some() {
@@ -2246,7 +2414,7 @@ impl App {
                 BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
                 24,
                 58 + index as i32 * 38,
-                462,
+                446,
                 28,
                 9400 + index,
             );
@@ -2257,11 +2425,15 @@ impl App {
             self.modal_control(
                 dialog,
                 "BUTTON",
-                "详情…",
+                if option.wifi_id.is_some() {
+                    "选择网络…"
+                } else {
+                    "详情…"
+                },
                 WS_TABSTOP,
-                500,
+                484,
                 56 + index as i32 * 38,
-                74,
+                90,
                 30,
                 9300 + index,
             );
@@ -2471,21 +2643,25 @@ impl App {
         self.update_traffic();
     }
     unsafe fn update_traffic(&self) {
-        let total = text(self.traffic_total)
+        let fallback = text(self.traffic_total)
             .trim()
             .parse::<f64>()
             .ok()
             .filter(|value| value.is_finite() && *value > 0.0)
-            .map(|value| value * 1_000_000_000.0);
+            .map(|value| value * 1_073_741_824.0);
+        let total = self
+            .traffic_total_bytes
+            .map(|value| value as f64)
+            .or(fallback);
         let (label, progress) = match self.traffic_used_bytes {
             Some(used) => {
                 let used_label = format_bytes(used);
                 match total {
                     Some(total) => (
-                        format!("已用 {used_label} / {} GB", text(self.traffic_total).trim()),
+                        format!("已用 {used_label} / {} GB", format_gb(total)),
                         ((used as f64 / total).min(1.0) * 1000.0) as usize,
                     ),
-                    None => (format!("已用 {used_label}"), 0),
+                    None => (format!("已用 {used_label} · 暂无额度信息"), 0),
                 }
             }
             None => ("尚未获取流量".into(), 0),
@@ -2632,6 +2808,7 @@ fn wifi_path() -> Result<PathBuf, String> {
     Ok(credential_path()?.with_file_name("wifi.json"))
 }
 fn format_bytes(bytes: u64) -> String {
+    // Match the campus portal's GB convention: 1 GB = 1024^3 bytes.
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut unit = 0;
@@ -2645,12 +2822,19 @@ fn format_bytes(bytes: u64) -> String {
         format!("{value:.2} {}", UNITS[unit])
     }
 }
+fn format_gb(bytes: f64) -> String {
+    format!("{:.2}", bytes / 1_073_741_824.0)
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
+}
 fn credential_path() -> Result<PathBuf, String> {
     Ok(
         PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("用户目录不可用")?)
             .join("BUAALoginNative/v1/credentials.dat"),
     )
 }
+
 fn log_folder() -> Result<PathBuf, String> {
     Ok(
         PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("用户目录不可用")?)
@@ -2767,7 +2951,7 @@ unsafe extern "system" fn modal_proc(
         _ => DefSubclassProc(hwnd, message, w, l),
     }
 }
-unsafe extern "system" fn navigation_proc(
+unsafe extern "system" fn display_proc(
     hwnd: HWND,
     message: u32,
     w: WPARAM,
@@ -2778,11 +2962,43 @@ unsafe extern "system" fn navigation_proc(
     if let Some(app) = (data as *const App).as_ref() {
         match message {
             WM_PAINT => {
+                app.paint_display(hwnd);
+                return 0;
+            }
+            WM_ERASEBKGND => return 1,
+            WM_SETTEXT | PBM_SETPOS | PBM_SETRANGE32 => {
+                let result = DefSubclassProc(hwnd, message, w, l);
+                InvalidateRect(hwnd, null(), 0);
+                return result;
+            }
+            WM_NCDESTROY => {
+                RemoveWindowSubclass(hwnd, Some(display_proc), id);
+            }
+            _ => {}
+        }
+    }
+    DefSubclassProc(hwnd, message, w, l)
+}
+unsafe extern "system" fn navigation_proc(
+    hwnd: HWND,
+    message: u32,
+    w: WPARAM,
+    l: LPARAM,
+    id: usize,
+    data: usize,
+) -> LRESULT {
+    if let Some(app) = (data as *mut App).as_mut() {
+        match message {
+            WM_PAINT => {
                 app.paint_navigation(hwnd);
                 return 0;
             }
             WM_ERASEBKGND => return 1,
-            WM_SETFOCUS | WM_KILLFOCUS | WM_UPDATEUISTATE => {
+            WM_SETFOCUS => {
+                app.ensure_main_visible(hwnd);
+                InvalidateRect(hwnd, null(), 0);
+            }
+            WM_KILLFOCUS | WM_UPDATEUISTATE => {
                 InvalidateRect(hwnd, null(), 0);
             }
             WM_NCDESTROY => {
@@ -2900,6 +3116,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
             }
             WM_COMMAND => {
                 let id = w & 0xffff;
+                let notification = (w >> 16) as u32;
+                if app.active_page == 0
+                    && l != 0
+                    && GetParent(l as HWND) == hwnd
+                    && (notification == BN_SETFOCUS || notification == EN_SETFOCUS)
+                {
+                    app.ensure_main_visible(l as HWND);
+                }
                 // Owner-draw/BS_NOTIFY buttons also send focus and double-click notices.
                 // Only a click may start work or mutate settings.
                 if l != 0
@@ -2922,6 +3146,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                         CONNECTION_SETTINGS,
                         ACCOUNT_SETTINGS,
                         SAVE_SETTINGS,
+                        GENERAL_SETTINGS,
+                        WIFI_SETTINGS,
                     ]
                     .contains(&id)
                     && w >> 16 != BN_CLICKED as usize
@@ -2934,6 +3160,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                     CONNECTION_SETTINGS => app.show_interface_dialog(),
                     ACCOUNT_SETTINGS => app.show_account_dialog(),
                     SAVE_SETTINGS => app.save_general_settings(),
+                    GENERAL_SETTINGS => app.show_page(1),
+                    WIFI_SETTINGS => app.show_wifi_dialog(),
                     AUTOSTART => app.startup_changed(),
                     20..=22 if w >> 16 == EN_CHANGE as usize => app.update_start_title(),
                     STOP => app.stop_worker(),
@@ -3018,6 +3246,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
             }
             WM_MOUSEWHEEL if app.active_page == 1 => {
                 return SendMessageW(app.settings_pane, message, w, l);
+            }
+            WM_MOUSEWHEEL => {
+                let delta = (w >> 16) as i16 as i32;
+                app.scroll_to(app.scroll - delta * app.px(40) / WHEEL_DELTA as i32);
+                return 0;
             }
             WM_VSCROLL => {
                 let mut info = SCROLLINFO {
@@ -3143,7 +3376,7 @@ pub fn run() {
         let _instance = InstanceGuard(handle);
         let common = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_STANDARD_CLASSES | ICC_TAB_CLASSES,
+            dwICC: ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_PROGRESS_CLASS,
         };
         InitCommonControlsEx(&common);
         let instance = GetModuleHandleW(null());
@@ -3185,8 +3418,8 @@ pub fn run() {
         let mut frame = RECT {
             left: 0,
             top: 0,
-            right: 680 * dpi / 96,
-            bottom: 700 * dpi / 96,
+            right: WINDOW_WIDTH * dpi / 96,
+            bottom: WINDOW_HEIGHT * dpi / 96,
         };
         AdjustWindowRectEx(&mut frame, style, 0, 0);
         let mut work: RECT = std::mem::zeroed();
@@ -3254,5 +3487,17 @@ pub fn run() {
                 DispatchMessageW(&message);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod traffic_display_tests {
+    #[test]
+    fn displayed_usage_and_quota_match_the_campus_portal_unit() {
+        let gib = 1u64 << 30;
+        assert_eq!(super::format_bytes(52 * gib), "52.00 GB");
+        assert_eq!(super::format_bytes(70 * gib), "70.00 GB");
+        assert_eq!(super::format_gb((70 * gib) as f64), "70");
+        assert_eq!(super::format_bytes(0), "0 B");
     }
 }

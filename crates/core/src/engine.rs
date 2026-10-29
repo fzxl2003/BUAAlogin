@@ -362,6 +362,8 @@ fn emit_dashboard(
         local_ip: current.map(|(i, _)| i.address),
         campus_ip: current.and_then(|(_, s)| s.session.campus_ip().map(str::to_owned)),
         traffic_used_bytes: current.and_then(|(_, s)| s.session.traffic_used_bytes()),
+        #[cfg(target_os = "windows")]
+        traffic_details: current.and_then(|(_, s)| s.session.traffic_details()),
         last_check_at: current.and_then(|(_, s)| s.last_check_at),
         retry_at: if matches!(phase, "retry" | "suspect" | "cooldown") {
             current.and_then(|(_, s)| s.retry_at)
@@ -1333,6 +1335,8 @@ fn check_connection(
         local_ip: Some(interface.address),
         campus_ip: slot.session.campus_ip().map(str::to_owned),
         traffic_used_bytes: slot.session.traffic_used_bytes(),
+        #[cfg(target_os = "windows")]
+        traffic_details: slot.session.traffic_details(),
         last_check_at: Some(unix_now()),
         retry_at: None,
         interval: config.interval,

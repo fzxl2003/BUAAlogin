@@ -133,6 +133,13 @@ mod config_tests {
 }
 
 /// Read-only UI state; timestamps are Unix seconds and addresses are never credentials.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct TrafficDetails {
+    pub used_bytes: u64,
+    pub total_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DashboardSnapshot {
     pub phase: String,
@@ -140,6 +147,9 @@ pub struct DashboardSnapshot {
     pub local_ip: Option<Ipv4Addr>,
     pub campus_ip: Option<String>,
     pub traffic_used_bytes: Option<u64>,
+    /// Windows display metadata from the existing status response, without extra requests.
+    #[cfg(target_os = "windows")]
+    pub traffic_details: Option<TrafficDetails>,
     pub last_check_at: Option<u64>,
     pub retry_at: Option<u64>,
     pub interval: u64,

@@ -249,6 +249,8 @@ pub struct Session {
     ip: Option<String>,
     acid: Option<String>,
     traffic_used_bytes: Option<u64>,
+    #[cfg(target_os = "windows")]
+    traffic_details: Option<crate::TrafficDetails>,
     generation: Arc<AtomicU64>,
     active_generation: u64,
     request_deadline: Option<crate::cancellation::Cancellation>,
@@ -298,6 +300,8 @@ impl Session {
             ip: None,
             acid: None,
             traffic_used_bytes: None,
+            #[cfg(target_os = "windows")]
+            traffic_details: None,
             active_generation: generation.load(Ordering::SeqCst),
             generation,
             request_deadline: None,
@@ -471,6 +475,10 @@ impl Session {
     pub fn traffic_used_bytes(&self) -> Option<u64> {
         self.traffic_used_bytes
     }
+    #[cfg(target_os = "windows")]
+    pub fn traffic_details(&self) -> Option<crate::TrafficDetails> {
+        self.traffic_details
+    }
 }
 pub fn validate_url(url: &Url) -> Result<(), String> {
     if url.scheme() != "https"
@@ -537,6 +545,10 @@ impl Portal for Session {
         self.traffic_used_bytes = parse_byte_count(&data["sum_bytes"])
             .or_else(|| parse_byte_count(&data["used_bytes"]))
             .or_else(|| parse_byte_count(&data["flow"]));
+        #[cfg(target_os = "windows")]
+        {
+            self.traffic_details = parse_traffic_details(&data);
+        }
         Ok(data["error"] == "ok"
             && data["online_ip"]
                 .as_str()
@@ -567,6 +579,25 @@ fn parse_byte_count(value: &Value) -> Option<u64> {
             .map(|number| number as u64)
     })
 }
+// BUAA's status response separates settled monthly usage from current online
+// sessions. The remaining allowance completes the current quota; do not infer a
+// quota when the server omits it or reports an unlimited/negative sentinel.
+#[cfg(target_os = "windows")]
+fn parse_traffic_details(data: &Value) -> Option<crate::TrafficDetails> {
+    if data["error"] != "ok" {
+        return None;
+    }
+    let used =
+        parse_byte_count(&data["sum_bytes"])?.checked_add(parse_byte_count(&data["all_bytes"])?)?;
+    let total = parse_byte_count(&data["remain_bytes"])
+        .and_then(|remaining| used.checked_add(remaining))
+        .filter(|total| *total > 0);
+    Some(crate::TrafficDetails {
+        used_bytes: used,
+        total_bytes: total,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,6 +619,36 @@ mod tests {
         assert_eq!(parse_byte_count(&serde_json::json!("5678")), Some(5678));
         assert_eq!(parse_byte_count(&serde_json::json!("12.9")), Some(12));
         assert_eq!(parse_byte_count(&serde_json::json!(-1)), None);
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn traffic_includes_online_sessions_and_server_allowance() {
+        let gib = 1u64 << 30;
+        let details = parse_traffic_details(&serde_json::json!({
+            "error": "ok", "sum_bytes": 50 * gib,
+            "all_bytes": (2 * gib).to_string(), "remain_bytes": 18 * gib
+        }))
+        .unwrap();
+        assert_eq!(details.used_bytes, 52 * gib);
+        assert_eq!(details.total_bytes, Some(70 * gib));
+    }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn traffic_does_not_invent_a_quota_or_overflow() {
+        let details = parse_traffic_details(&serde_json::json!({
+            "error": "ok", "sum_bytes": 5, "all_bytes": 2, "remain_bytes": -1
+        }))
+        .unwrap();
+        assert_eq!(details.used_bytes, 7);
+        assert_eq!(details.total_bytes, None);
+        assert!(parse_traffic_details(&serde_json::json!({"error": "not_online_error"})).is_none());
+        assert!(
+            parse_traffic_details(&serde_json::json!({"error": "ok", "sum_bytes": 5})).is_none()
+        );
+        assert!(parse_traffic_details(
+            &serde_json::json!({"error": "ok", "sum_bytes": u64::MAX, "all_bytes": 1})
+        )
+        .is_none());
     }
     fn fixture(bodies: &[&str]) -> Session {
         let i = Interface {
