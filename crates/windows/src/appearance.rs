@@ -19,6 +19,7 @@ pub struct Palette {
     pub soft: COLORREF,
     pub success: COLORREF,
     pub warning: COLORREF,
+    pub error: COLORREF,
     pub high_contrast: bool,
 }
 impl Palette {
@@ -38,23 +39,42 @@ impl Palette {
                 soft: GetSysColor(COLOR_WINDOW),
                 success: GetSysColor(COLOR_WINDOWTEXT),
                 warning: GetSysColor(COLOR_WINDOWTEXT),
+                error: GetSysColor(COLOR_WINDOWTEXT),
                 high_contrast: true,
             };
         }
         Self {
-            background: rgb(245, 247, 251),
+            background: rgb(245, 247, 249),
             surface: rgb(255, 255, 255),
             text: rgb(28, 39, 59),
             muted: rgb(96, 111, 132),
             border: rgb(223, 229, 238),
-            accent: rgb(40, 93, 210),
+            accent: rgb(0, 120, 240),
             accent_text: rgb(255, 255, 255),
             soft: rgb(233, 239, 250),
-            success: rgb(26, 125, 87),
-            warning: rgb(166, 98, 13),
+            success: rgb(36, 184, 88),
+            warning: rgb(214, 137, 24),
+            error: rgb(211, 57, 63),
             high_contrast: false,
         }
     }
+}
+
+/// Only known result labels get a dot. Test/running messages retain plain text,
+/// so updating the native label also clears a previous success indication.
+pub fn badge_color(label: &[u16], palette: Palette) -> Option<COLORREF> {
+    for (text, color) in [
+        ("已认证", palette.success),
+        ("可用", palette.success),
+        ("未认证", palette.warning),
+        ("不可用", palette.error),
+        ("未知", palette.muted),
+    ] {
+        if label.iter().copied().eq(text.encode_utf16()) {
+            return Some(color);
+        }
+    }
+    None
 }
 
 pub unsafe fn brush(dc: HDC, color: COLORREF) -> HBRUSH {
@@ -128,4 +148,38 @@ pub unsafe fn app_icon() -> HICON {
     DeleteDC(dc);
     ReleaseDC(null_mut(), screen);
     icon
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn badges_distinguish_authentication_connectivity_and_unknown() {
+        let p = unsafe { Palette::system() };
+        for (label, expected) in [
+            ("已认证", p.success),
+            ("可用", p.success),
+            ("未认证", p.warning),
+            ("不可用", p.error),
+            ("未知", p.muted),
+        ] {
+            assert_eq!(
+                badge_color(&label.encode_utf16().collect::<Vec<_>>(), p),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn testing_and_fallback_messages_do_not_keep_a_success_dot() {
+        let p = unsafe { Palette::system() };
+        for label in ["正在测试…", "尚未运行", "—", "测试失败", "认证测试成功"]
+        {
+            assert_eq!(
+                badge_color(&label.encode_utf16().collect::<Vec<_>>(), p),
+                None
+            );
+        }
+    }
 }
